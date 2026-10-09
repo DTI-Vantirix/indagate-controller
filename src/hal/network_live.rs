@@ -2,26 +2,16 @@
 //! Deliberately NOT registered with cloud command dispatch.
 //! A future caller must supply a real authenticated cloud confirmation callback.
 use crate::hal::network_checkpoint::NetworkCheckpoint;
+use crate::hal::network_safety::{HostNetworkLock, bounded_command};
 use crate::hal::network_transaction::{NetworkTransactionBackend, TransactionPlan};
 use anyhow::{Context, Result, anyhow};
-use std::process::Command;
+use std::path::Path;
+use std::time::Duration;
 
 const CLOUD_URL: &str = "https://gxwfuurzkdhxwxdbtdmt.supabase.co/functions/v1/nexus-device";
 
 fn command(program: &str, args: &[&str]) -> Result<String> {
-    let output = Command::new(program)
-        .args(args)
-        .output()
-        .with_context(|| format!("unable to run {program}"))?;
-    if !output.status.success() {
-        return Err(anyhow!(
-            "{} exited with {}: {}",
-            program,
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+    bounded_command(program, args, Duration::from_secs(25))
 }
 
 fn active_uuid() -> Result<String> {
@@ -81,6 +71,7 @@ pub trait CloudConfirmation {
 pub struct LiveNetworkBackend<C: CloudConfirmation> {
     checkpoint: Option<NetworkCheckpoint>,
     confirmation: C,
+    host_lock: Option<HostNetworkLock>,
 }
 
 impl<C: CloudConfirmation> LiveNetworkBackend<C> {
@@ -88,12 +79,20 @@ impl<C: CloudConfirmation> LiveNetworkBackend<C> {
         Self {
             checkpoint: None,
             confirmation,
+            host_lock: None,
         }
     }
 }
 
 impl<C: CloudConfirmation> NetworkTransactionBackend for LiveNetworkBackend<C> {
     fn preflight(&mut self, plan: &TransactionPlan) -> Result<()> {
+        if self.host_lock.is_some() {
+            return Err(anyhow!("network transaction lock already held"));
+        }
+        self.host_lock = Some(HostNetworkLock::acquire(Path::new(
+            "/run/lock/hlaxs-network.lock",
+        ))?);
+
         if plan.interface != "wlan0" {
             return Err(anyhow!("unsupported network interface"));
         }

@@ -1,25 +1,13 @@
+use crate::hal::network_safety::bounded_command;
 use anyhow::{Context, Result, anyhow};
-use std::process::Command;
+use std::time::Duration;
 
 const NM_SERVICE: &str = "org.freedesktop.NetworkManager";
 const NM_PATH: &str = "/org/freedesktop/NetworkManager";
 const WIFI_IFACE: &str = "wlan0";
 
 fn run(program: &str, args: &[&str]) -> Result<String> {
-    let output = Command::new(program)
-        .args(args)
-        .output()
-        .with_context(|| format!("failed to execute {}", program))?;
-
-    if !output.status.success() {
-        return Err(anyhow!(
-            "{} failed: {}",
-            program,
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    bounded_command(program, args, Duration::from_secs(25))
 }
 
 fn validate_object_path(path: &str) -> Result<()> {
