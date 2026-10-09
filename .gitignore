@@ -1,0 +1,23 @@
+# Rust build outputs
+/target/
+
+# Local environment and credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*secret*
+
+# Local source backups
+*.pre-*
+*.bak
+*~
+
+# Editor and OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
