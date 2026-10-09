@@ -673,6 +673,18 @@ async fn handle_command(
                 "message": "configuration synchronization requested"
             })),
 
+            "wifi_profile_preflight" => {
+                let profile_name = command.payload["profile_name"]
+                    .as_str()
+                    .ok_or_else(|| anyhow!("wifi_profile_preflight missing profile_name"))?
+                    .to_string();
+                tokio::task::spawn_blocking(move || {
+                    network_manager::wifi_profile_preflight(&profile_name)
+                })
+                .await
+                .map_err(|e| anyhow!("wifi profile preflight task failed: {}", e))?
+            }
+
             "wifi_status" => tokio::task::spawn_blocking(network_manager::wifi_status)
                 .await
                 .map_err(|e| anyhow!("wifi status task failed: {}", e))?,

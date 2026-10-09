@@ -113,6 +113,9 @@ fn validate_rollback_response(response: &str) -> Result<()> {
         let status: u32 = entry[1].parse()?;
 
         validate_object_path(device)?;
+        if !device.starts_with("/org/freedesktop/NetworkManager/Devices/") {
+            return Err(anyhow!("rollback response contains unexpected device path"));
+        }
 
         if status != 0 {
             return Err(anyhow!(
@@ -215,6 +218,16 @@ mod tests {
         assert!(
             validate_rollback_response(r#"a{su} 1 "/org/freedesktop/NetworkManager/Devices/4" 2"#)
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn rejects_rollback_result_for_unexpected_object() {
+        assert!(
+            validate_rollback_response(
+                r#"a{su} 1 "/org/freedesktop/NetworkManager/Checkpoint/1" 0"#
+            )
+            .is_err()
         );
     }
 

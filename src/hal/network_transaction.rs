@@ -45,9 +45,53 @@ pub fn valid_transition(current: TransactionState, next: TransactionState) -> bo
     )
 }
 
+/// A side-effect-free description of a proposed network transaction.
+/// No checkpoint is created and no profile is activated by this function.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransactionPlan {
+    pub interface: &'static str,
+    pub profile_uuid: String,
+    pub rollback_timeout_seconds: u32,
+}
+
+pub fn validate_transaction_plan(
+    profile_uuid: &str,
+    timeout_seconds: u32,
+) -> Result<TransactionPlan> {
+    let parsed =
+        uuid::Uuid::parse_str(profile_uuid).map_err(|_| anyhow!("invalid Wi-Fi profile UUID"))?;
+    if !(60..=600).contains(&timeout_seconds) {
+        return Err(anyhow!("rollback timeout must be 60..=600 seconds"));
+    }
+    Ok(TransactionPlan {
+        interface: "wlan0",
+        profile_uuid: parsed.to_string(),
+        rollback_timeout_seconds: timeout_seconds,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn plan_accepts_valid_uuid_and_timeout() {
+        let plan = validate_transaction_plan("b5513ddd-ca75-498c-97d1-2e2b5c151ec0", 120).unwrap();
+        assert_eq!(plan.interface, "wlan0");
+        assert_eq!(plan.rollback_timeout_seconds, 120);
+    }
+
+    #[test]
+    fn plan_rejects_bad_uuid() {
+        assert!(validate_transaction_plan("not-uuid", 120).is_err());
+    }
+
+    #[test]
+    fn plan_rejects_unsafe_timeout() {
+        let uuid = "b5513ddd-ca75-498c-97d1-2e2b5c151ec0";
+        assert!(validate_transaction_plan(uuid, 0).is_err());
+        assert!(validate_transaction_plan(uuid, 601).is_err());
+    }
 
     #[test]
     fn acquires_network_lock() {
