@@ -1,7 +1,7 @@
 //! Durable reservation of credential rotation commands.
 //! Reserved rotation commands are ambiguous after interruption: never prepare twice.
 use anyhow::{Context, Result, anyhow};
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, TransactionBehavior, params};
 use std::path::Path;
 use std::time::Duration;
 
@@ -48,7 +48,9 @@ impl CredentialRotationJournal {
         if !valid_command_id(command_id) {
             return Err(anyhow!("invalid credential rotation command identifier"));
         }
-        let tx = self.conn.transaction()?;
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         // Never initiate a different rotation while an earlier prepare may
         // have reached the server; require explicit reconciliation first.
         let existing: i64 = tx.query_row(
@@ -189,6 +191,71 @@ mod tests {
         assert!(journal.reserve(&"x".repeat(129)).is_err());
         assert!(journal.unresolved().unwrap().is_empty());
         drop(journal);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn refuses_competing_rotation_after_restart() {
+        let path = temp_path();
+        {
+            let mut first = CredentialRotationJournal::open(&path).unwrap();
+            assert_eq!(
+                first.reserve("rotation_a").unwrap(),
+                RotationReservation::New
+            );
+        }
+        {
+            let mut restarted = CredentialRotationJournal::open(&path).unwrap();
+            assert!(restarted.reserve("rotation_b").is_err());
+            assert_eq!(
+                restarted.reserve("rotation_a").unwrap(),
+                RotationReservation::AlreadyReserved
+            );
+            assert_eq!(restarted.unresolved().unwrap(), vec!["rotation_a"]);
+        }
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn completed_rotation_allows_next_rotation() {
+        let path = temp_path();
+        let mut journal = CredentialRotationJournal::open(&path).unwrap();
+        journal.reserve("rotation_a").unwrap();
+        assert!(journal.mark_completed("rotation_a").unwrap());
+        assert_eq!(
+            journal.reserve("rotation_b").unwrap(),
+            RotationReservation::New
+        );
+        assert_eq!(journal.unresolved().unwrap(), vec!["rotation_b"]);
+        drop(journal);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn completing_wrong_id_does_not_clear_pending() {
+        let path = temp_path();
+        let mut journal = CredentialRotationJournal::open(&path).unwrap();
+        journal.reserve("rotation_a").unwrap();
+        assert!(!journal.mark_completed("rotation_b").unwrap());
+        assert!(journal.reserve("rotation_c").is_err());
+        assert_eq!(journal.unresolved().unwrap(), vec!["rotation_a"]);
+        drop(journal);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn competing_client_cannot_reserve_second_rotation() {
+        let path = temp_path();
+        let mut one = CredentialRotationJournal::open(&path).unwrap();
+        let mut two = CredentialRotationJournal::open(&path).unwrap();
+        assert_eq!(one.reserve("rotation_a").unwrap(), RotationReservation::New);
+        assert!(two.reserve("rotation_b").is_err());
+        assert_eq!(
+            two.reserve("rotation_a").unwrap(),
+            RotationReservation::AlreadyReserved
+        );
+        drop(one);
+        drop(two);
         let _ = std::fs::remove_file(path);
     }
 }

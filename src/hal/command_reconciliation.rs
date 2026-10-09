@@ -38,6 +38,14 @@ pub fn inspect(path: &Path) -> Result<Value> {
         &conn,
         "SELECT command_id FROM network_command_journal WHERE status='reserved' ORDER BY created_at, command_id",
     )?;
+    let ambiguous_credential_rotation_ids = ids(
+        &conn,
+        "SELECT command_id FROM credential_rotation_journal WHERE state='reserved' ORDER BY created_at, command_id",
+    ).context("credential rotation journal not available")?;
+    let completed_credential_rotation_count = count(
+        &conn,
+        "SELECT COUNT(*) FROM credential_rotation_journal WHERE state='completed'",
+    )?;
     let guarded_wifi_rejections_pending = count(
         &conn,
         "SELECT COUNT(*) FROM guarded_network_rejections WHERE reported=0",
@@ -47,6 +55,8 @@ pub fn inspect(path: &Path) -> Result<Value> {
         "mode": "read_only",
         "ambiguous_actuator_command_ids": ambiguous_actuator_ids,
         "ambiguous_network_command_ids": pending_network_ids,
+        "ambiguous_credential_rotation_command_ids": ambiguous_credential_rotation_ids,
+        "completed_credential_rotation_count": completed_credential_rotation_count,
         "actuator_terminal_ack_backlog": actuator_ack_backlog,
         "network_terminal_ack_backlog": network_ack_backlog,
         "guarded_wifi_rejection_ack_backlog": guarded_wifi_rejections_pending,
@@ -68,7 +78,8 @@ mod tests {
         conn.execute_batch(
             "CREATE TABLE actuator_command_journal (command_id TEXT, state TEXT, reported INTEGER, created_at TEXT);
              CREATE TABLE network_command_journal (command_id TEXT, status TEXT, reported INTEGER, created_at TEXT);
-             CREATE TABLE guarded_network_rejections (reported INTEGER);"
+             CREATE TABLE guarded_network_rejections (reported INTEGER);
+             CREATE TABLE credential_rotation_journal (command_id TEXT, state TEXT, created_at TEXT);"
         ).unwrap();
         (path, conn)
     }
@@ -81,7 +92,9 @@ mod tests {
              INSERT INTO actuator_command_journal VALUES ('relay_124','completed',0,'2026-01-02');
              INSERT INTO network_command_journal VALUES ('wifi_123','reserved',0,'2026-01-01');
              INSERT INTO network_command_journal VALUES ('wifi_124','failed',0,'2026-01-02');
-             INSERT INTO guarded_network_rejections VALUES (0);",
+             INSERT INTO guarded_network_rejections VALUES (0);
+             INSERT INTO credential_rotation_journal VALUES ('rotation_123','reserved','2026-01-01');
+             INSERT INTO credential_rotation_journal VALUES ('rotation_124','completed','2026-01-02');",
         )
         .unwrap();
         let result = inspect(&path).unwrap();
@@ -93,6 +106,11 @@ mod tests {
         assert_eq!(result["actuator_terminal_ack_backlog"], 1);
         assert_eq!(result["network_terminal_ack_backlog"], 1);
         assert_eq!(result["guarded_wifi_rejection_ack_backlog"], 1);
+        assert_eq!(
+            result["ambiguous_credential_rotation_command_ids"],
+            json!(["rotation_123"])
+        );
+        assert_eq!(result["completed_credential_rotation_count"], 1);
         let persisted: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM actuator_command_journal WHERE state='reserved'",
@@ -112,6 +130,11 @@ mod tests {
         assert_eq!(result["ambiguous_actuator_command_ids"], json!([]));
         assert_eq!(result["ambiguous_network_command_ids"], json!([]));
         assert_eq!(result["actuator_terminal_ack_backlog"], 0);
+        assert_eq!(
+            result["ambiguous_credential_rotation_command_ids"],
+            json!([])
+        );
+        assert_eq!(result["completed_credential_rotation_count"], 0);
         drop(conn);
         let _ = std::fs::remove_file(path);
     }
