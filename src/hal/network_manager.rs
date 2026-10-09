@@ -247,3 +247,49 @@ pub fn wifi_activate_saved(profile_name: &str) -> Result<Value> {
         "state": "activated"
     }))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_standard_nmcli_fields() {
+        let result = split_nmcli_terse("wlan0:wifi:connected:Office WiFi");
+
+        assert_eq!(result, vec!["wlan0", "wifi", "connected", "Office WiFi"]);
+    }
+
+    #[test]
+    fn parses_escaped_colons() {
+        let result = split_nmcli_terse(r"AA\:BB\:CC\:DD\:EE\:FF:Office WiFi:6:85:WPA2");
+
+        assert_eq!(
+            result,
+            vec!["AA:BB:CC:DD:EE:FF", "Office WiFi", "6", "85", "WPA2"]
+        );
+    }
+
+    #[test]
+    fn parses_empty_fields() {
+        let result = split_nmcli_terse("wlan0:wifi:disconnected:");
+
+        assert_eq!(result, vec!["wlan0", "wifi", "disconnected", ""]);
+    }
+
+    #[test]
+    fn parses_escaped_backslashes() {
+        let result = split_nmcli_terse(r"Office\\Network:wifi:connected:Office");
+
+        assert_eq!(
+            result,
+            vec!["Office\\Network", "wifi", "connected", "Office"]
+        );
+    }
+
+    #[test]
+    fn preserves_trailing_escape() {
+        let result = split_nmcli_terse("Office\\");
+
+        assert_eq!(result, vec!["Office\\"]);
+    }
+}
