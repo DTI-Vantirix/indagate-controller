@@ -640,6 +640,10 @@ async fn acknowledge_command(
     Ok(())
 }
 
+fn network_command_requires_protection(command_type: &str) -> bool {
+    matches!(command_type, "wifi_disconnect" | "wifi_activate_saved")
+}
+
 async fn handle_command(
     identity: &DeviceIdentity,
     command: DeviceCommand,
@@ -654,6 +658,12 @@ async fn handle_command(
     }
 
     let result: Result<Value> = async {
+        if network_command_requires_protection(&command.command_type) {
+            return Err(anyhow!(
+                "network configuration command disabled until protected switching is implemented"
+            ));
+        }
+
         match command.command_type.as_str() {
             "diagnostic_request" => Ok(json!({
                 "message": "diagnostic request acknowledged"
