@@ -415,26 +415,49 @@ async fn finalize_pending_credential_rotation(identity: &mut DeviceIdentity) -> 
     Ok(true)
 }
 
-async fn rotate_device_credential(identity: &DeviceIdentity, command_id: &str) -> Result<()> {
-    let prepared = authenticated_post(identity, "/v1/credential/rotate/prepare", json!({}))
-        .await
-        .context("prepare Nexus device credential rotation")?;
-
-    let certificate_id = prepared.data["certificate_id"]
+/// Validate rotation preparation before any durable identity change.
+/// Do not include a returned secret in error messages or logs.
+fn validate_rotation_prepare(data: &Value) -> Result<(String, String)> {
+    let certificate_id = data["certificate_id"]
         .as_str()
-        .ok_or_else(|| anyhow!("credential rotation response missing certificate_id"))?
-        .to_string();
-
-    let device_secret = prepared.data["device_secret"]
+        .ok_or_else(|| anyhow!("credential rotation response missing certificate_id"))?;
+    let secret = data["device_secret"]
         .as_str()
-        .ok_or_else(|| anyhow!("credential rotation response missing device_secret"))?
-        .to_string();
-
-    if device_secret.len() < 32 {
+        .ok_or_else(|| anyhow!("credential rotation response missing device_secret"))?;
+    if certificate_id.is_empty()
+        || certificate_id.len() > 256
+        || certificate_id.chars().any(char::is_control)
+    {
+        return Err(anyhow!(
+            "credential rotation returned invalid certificate identifier"
+        ));
+    }
+    if secret.len() < 32 || secret.len() > 4096 || secret.chars().any(char::is_control) {
         return Err(anyhow!(
             "credential rotation returned invalid device secret"
         ));
     }
+    Ok((certificate_id.to_string(), secret.to_string()))
+}
+
+/// An unfinished rotation must complete through the existing startup recovery path.
+/// In particular, never issue a second prepare with an old in-memory identity.
+fn ensure_no_pending_rotation(identity: &DeviceIdentity) -> Result<()> {
+    if identity.pending_certificate_id.is_some() || identity.pending_rotation_command_id.is_some() {
+        return Err(anyhow!(
+            "pending credential rotation requires startup reconciliation"
+        ));
+    }
+    Ok(())
+}
+
+async fn rotate_device_credential(identity: &DeviceIdentity, command_id: &str) -> Result<()> {
+    ensure_no_pending_rotation(identity)?;
+    let prepared = authenticated_post(identity, "/v1/credential/rotate/prepare", json!({}))
+        .await
+        .context("prepare Nexus device credential rotation")?;
+
+    let (certificate_id, device_secret) = validate_rotation_prepare(&prepared.data)?;
 
     //
     // The cloud has provisioned NEW before this local identity is
@@ -1856,5 +1879,83 @@ mod deferred_ack_delivery_tests {
     async fn empty_ack_batch_is_successful() {
         let result = deliver_ack_batch(Vec::<u32>::new(), |_id| async { Ok(()) }).await;
         assert!(result.is_ok());
+    }
+}
+
+#[cfg(test)]
+mod credential_rotation_safety_tests {
+    use super::*;
+
+    fn example_identity() -> DeviceIdentity {
+        DeviceIdentity {
+            device_id: "device_test".into(),
+            controller_id: "controller_test".into(),
+            organization_id: "organization_test".into(),
+            site_id: "site_test".into(),
+            device_secret: "old_secret_for_testing_only_000000000".into(),
+            hardware_profile: "ACP4WR6-R1".into(),
+            pending_certificate_id: None,
+            pending_rotation_command_id: None,
+        }
+    }
+
+    #[test]
+    fn accepts_well_formed_rotation_prepare() {
+        let data = json!({
+            "certificate_id": "cert_123",
+            "device_secret": "abcdefghijklmnopqrstuvwxyz012345"
+        });
+        let (cert, secret) = validate_rotation_prepare(&data).unwrap();
+        assert_eq!(cert, "cert_123");
+        assert_eq!(secret.len(), 32);
+    }
+
+    #[test]
+    fn rejects_missing_prepare_fields() {
+        assert!(validate_rotation_prepare(&json!({})).is_err());
+        assert!(validate_rotation_prepare(&json!({"certificate_id":"cert"})).is_err());
+    }
+
+    #[test]
+    fn rejects_invalid_certificate_id() {
+        let secret = "a".repeat(32);
+        for bad in ["".to_string(), "x".repeat(257), "cert\nnew".into()] {
+            assert!(
+                validate_rotation_prepare(&json!({"certificate_id":bad,"device_secret":secret}))
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_secret_without_leaking_it() {
+        for bad in [
+            "short".to_string(),
+            "a".repeat(4097),
+            format!("{}\n", "a".repeat(32)),
+        ] {
+            let error =
+                validate_rotation_prepare(&json!({"certificate_id":"cert","device_secret":bad}))
+                    .unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "credential rotation returned invalid device secret"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_pending_rotation_without_repreparing() {
+        let mut identity = example_identity();
+        identity.pending_certificate_id = Some("pending_cert".into());
+        assert!(ensure_no_pending_rotation(&identity).is_err());
+        identity.pending_certificate_id = None;
+        identity.pending_rotation_command_id = Some("pending_command".into());
+        assert!(ensure_no_pending_rotation(&identity).is_err());
+    }
+
+    #[test]
+    fn permits_rotation_when_no_pending_state() {
+        assert!(ensure_no_pending_rotation(&example_identity()).is_ok());
     }
 }
