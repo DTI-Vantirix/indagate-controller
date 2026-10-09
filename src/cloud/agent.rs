@@ -1611,3 +1611,33 @@ pub async fn run(db_path: &str, relay_tx: mpsc::Sender<RelayCommand>) {
         }
     }
 }
+
+#[cfg(test)]
+mod network_command_guard_tests {
+    use super::*;
+
+    #[test]
+    fn blocks_unprotected_wifi_disconnect() {
+        assert!(network_command_requires_protection("wifi_disconnect"));
+    }
+
+    #[test]
+    fn blocks_unprotected_wifi_activation() {
+        assert!(network_command_requires_protection("wifi_activate_saved"));
+    }
+
+    #[test]
+    fn permits_wifi_status() {
+        assert!(!network_command_requires_protection("wifi_status"));
+    }
+
+    #[test]
+    fn permits_wifi_scan() {
+        assert!(!network_command_requires_protection("wifi_scan"));
+    }
+
+    #[test]
+    fn permits_wifi_radio_enable() {
+        assert!(!network_command_requires_protection("wifi_radio_enable"));
+    }
+}
