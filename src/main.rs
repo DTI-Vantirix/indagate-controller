@@ -139,6 +139,23 @@ async fn main() -> Result<()> {
     let db_path =
         std::env::var("NEXUS_DB_PATH").unwrap_or_else(|_| storage::DEFAULT_DB_PATH.to_string());
 
+    // Offline schema migration check for an EXPLICITLY SUPPLIED test DB only.
+    // Must exit before hardware inspection, I/O workers, or cloud operations.
+    if args.get(1).map(String::as_str) == Some("migrate-only") {
+        let explicit_path = std::env::var("NEXUS_DB_PATH")
+            .map_err(|_| anyhow!("migrate-only requires explicit NEXUS_DB_PATH"))?;
+        if explicit_path == storage::DEFAULT_DB_PATH {
+            return Err(anyhow!("migrate-only refuses the default live database"));
+        }
+        let test_path = std::path::Path::new(&explicit_path);
+        if !test_path.is_file() {
+            return Err(anyhow!("migrate-only requires an existing database file"));
+        }
+        let _database = storage::NexusDatabase::open(&explicit_path)?;
+        println!("MIGRATION-ONLY PASSED — no hardware or cloud workers started");
+        return Ok(());
+    }
+
     // Local read-only inspection of persisted command outcomes. This must run
     // before opening hardware or launching any of the controller's tasks.
     if args.get(1).map(String::as_str) == Some("journal-status") {
