@@ -1,3 +1,4 @@
+use crate::hal::actuator_command_journal::{ActuatorCommandJournal, ReserveResult};
 use crate::hal::network_command_journal::NetworkCommandJournal;
 use crate::hal::network_manager;
 use crate::hal::telemetry;
@@ -641,6 +642,13 @@ async fn acknowledge_command(
     Ok(())
 }
 
+fn is_actuator_command(command_type: &str) -> bool {
+    matches!(
+        command_type,
+        "door_hold_open" | "door_lock" | "door_return_to_schedule" | "relay_pulse"
+    )
+}
+
 fn network_command_requires_protection(command_type: &str) -> bool {
     matches!(command_type, "wifi_disconnect" | "wifi_activate_saved")
 }
@@ -650,6 +658,7 @@ async fn handle_command(
     command: DeviceCommand,
     relay_tx: &mpsc::Sender<RelayCommand>,
     journal: &NetworkCommandJournal,
+    actuator_journal: &mut ActuatorCommandJournal,
 ) -> Result<()> {
     // Guarded commands are never executed, even if journaling or cloud ACK fails.
     // Persist the failure first, then use the retryable outbox.
@@ -658,6 +667,22 @@ async fn handle_command(
         return Ok(());
     }
 
+    let actuator = is_actuator_command(&command.command_type);
+    if actuator {
+        // The SQLite reservation commits before any actuator operation. A duplicate,
+        // including a replay after a crash, never activates the relay again.
+        match actuator_journal.reserve(&command.id, &command.command_type, &command.payload)? {
+            ReserveResult::New => {}
+            ReserveResult::AlreadyReserved => {
+                warn!(command_id = %command.id, "Ambiguous actuator command requires reconciliation");
+                return Ok(());
+            }
+            ReserveResult::AlreadyTerminal => return Ok(()),
+        }
+    }
+
+    // Do not execute a newly reserved actuator command if initial ACK fails.
+    // The reserved record remains ambiguous, requiring operator reconciliation.
     acknowledge_command(identity, &command.id, "acknowledged", json!({}), None).await?;
 
     if command.command_type == "credential_rotate" {
@@ -894,6 +919,13 @@ async fn handle_command(
     }
     .await;
 
+    if actuator {
+        // Always persist the terminal outcome before delivery. ACK failure cannot
+        // lead to a second physical actuation on retry.
+        actuator_journal.finish(&command.id, &result)?;
+        return Ok(());
+    }
+
     match result {
         Ok(result) => {
             acknowledge_command(identity, &command.id, "completed", result, None).await?;
@@ -911,6 +943,24 @@ async fn handle_command(
         }
     }
 
+    Ok(())
+}
+
+async fn flush_actuator_acks(
+    identity: &DeviceIdentity,
+    journal: &ActuatorCommandJournal,
+) -> Result<()> {
+    for report in journal.unreported(25)? {
+        acknowledge_command(
+            identity,
+            &report.command_id,
+            &report.state,
+            report.result,
+            report.failure_reason.as_deref(),
+        )
+        .await?;
+        journal.mark_reported(&report.command_id)?;
+    }
     Ok(())
 }
 
@@ -939,13 +989,15 @@ async fn poll_commands(
     identity: &DeviceIdentity,
     relay_tx: &mpsc::Sender<RelayCommand>,
     journal: &NetworkCommandJournal,
+    actuator_journal: &mut ActuatorCommandJournal,
 ) -> Result<()> {
     let envelope = authenticated_get(identity, "/v1/commands").await?;
 
     let list: CommandList = serde_json::from_value(envelope.data)?;
 
     for command in list.commands {
-        if let Err(e) = handle_command(identity, command, relay_tx, journal).await {
+        if let Err(e) = handle_command(identity, command, relay_tx, journal, actuator_journal).await
+        {
             warn!(
                 error = %e,
                 "Nexus command handling failed"
@@ -1558,6 +1610,27 @@ pub async fn run(db_path: &str, relay_tx: mpsc::Sender<RelayCommand>) {
         }
     };
 
+    let mut actuator_journal = match ActuatorCommandJournal::open(&journal_path) {
+        Ok(journal) => journal,
+        Err(e) => {
+            error!(error = %e, "Actuator journal unavailable; cloud agent disabled");
+            return;
+        }
+    };
+    match actuator_journal.unresolved() {
+        Ok(ids) if !ids.is_empty() => {
+            warn!(
+                count = ids.len(),
+                "Interrupted actuator commands require manual reconciliation"
+            );
+        }
+        Err(e) => {
+            error!(error = %e, "Actuator reconciliation unavailable; cloud agent disabled");
+            return;
+        }
+        _ => {}
+    }
+
     info!(
         controller_id = %identity.controller_id,
         "Nexus cloud agent started"
@@ -1633,6 +1706,9 @@ pub async fn run(db_path: &str, relay_tx: mpsc::Sender<RelayCommand>) {
             }
 
             _ = command_timer.tick() => {
+                if let Err(e) = flush_actuator_acks(&identity, &actuator_journal).await {
+                    warn!(error = %e, "Deferred actuator acknowledgement failed");
+                }
                 if let Err(e) = flush_guarded_network_acks(&identity, &network_journal).await {
                     warn!(error = %e, "Deferred network rejection acknowledgement failed");
                 }
@@ -1642,6 +1718,7 @@ pub async fn run(db_path: &str, relay_tx: mpsc::Sender<RelayCommand>) {
                         &identity,
                         &relay_tx,
                         &network_journal,
+                        &mut actuator_journal,
                     )
                     .await
                 {
