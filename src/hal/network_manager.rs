@@ -193,6 +193,65 @@ pub fn wifi_disconnect() -> Result<Value> {
     }))
 }
 
+fn validate_profile_name(profile_name: &str) -> Result<&str> {
+    let name = profile_name.trim();
+
+    if name.is_empty() {
+        return Err(anyhow!("Wi-Fi profile name is required"));
+    }
+
+    if name.len() > 128 {
+        return Err(anyhow!("Wi-Fi profile name exceeds 128 bytes"));
+    }
+
+    if name.chars().any(|c| c.is_control()) {
+        return Err(anyhow!("Wi-Fi profile name contains control characters"));
+    }
+
+    Ok(name)
+}
+
+fn validate_wifi_connection_type(connection_type: &str) -> Result<()> {
+    if connection_type.trim() != "802-11-wireless" {
+        return Err(anyhow!("saved connection is not a Wi-Fi profile"));
+    }
+
+    Ok(())
+}
+
+pub fn wifi_profile_preflight(profile_name: &str) -> Result<Value> {
+    let name = validate_profile_name(profile_name)?;
+
+    let connection_type = nmcli(&["-g", "connection.type", "connection", "show", name])?;
+
+    validate_wifi_connection_type(&connection_type)?;
+
+    let uuid = nmcli(&["-g", "connection.uuid", "connection", "show", name])?;
+
+    let uuid = uuid::Uuid::parse_str(uuid.trim())
+        .map_err(|_| anyhow!("saved Wi-Fi profile has invalid UUID"))?;
+
+    let bound_iface = nmcli(&[
+        "-g",
+        "connection.interface-name",
+        "connection",
+        "show",
+        name,
+    ])?;
+
+    if !bound_iface.is_empty() && bound_iface != WIFI_IFACE {
+        return Err(anyhow!("saved Wi-Fi profile is bound to another interface"));
+    }
+
+    Ok(json!({
+        "profile_name": name,
+        "profile_uuid": uuid.to_string(),
+        "interface": WIFI_IFACE,
+        "connection_type": connection_type.trim(),
+        "valid": true
+    }))
+}
+
 pub fn wifi_activate_saved(profile_name: &str) -> Result<Value> {
     let profile_name = profile_name.trim();
 
@@ -251,6 +310,44 @@ pub fn wifi_activate_saved(profile_name: &str) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejects_empty_profile_name() {
+        assert!(validate_profile_name("").is_err());
+        assert!(validate_profile_name("   ").is_err());
+    }
+
+    #[test]
+    fn rejects_profile_name_control_characters() {
+        assert!(validate_profile_name("Office\nWiFi").is_err());
+        assert!(validate_profile_name("Office\0WiFi").is_err());
+    }
+
+    #[test]
+    fn rejects_oversized_profile_name() {
+        let name = "A".repeat(129);
+        assert!(validate_profile_name(&name).is_err());
+    }
+
+    #[test]
+    fn accepts_valid_profile_name() {
+        assert_eq!(
+            validate_profile_name(" Office WiFi ").unwrap(),
+            "Office WiFi"
+        );
+    }
+
+    #[test]
+    fn accepts_wireless_connection_type() {
+        assert!(validate_wifi_connection_type("802-11-wireless").is_ok());
+    }
+
+    #[test]
+    fn rejects_non_wireless_connection_type() {
+        assert!(validate_wifi_connection_type("802-3-ethernet").is_err());
+
+        assert!(validate_wifi_connection_type("vpn").is_err());
+    }
 
     #[test]
     fn parses_standard_nmcli_fields() {
