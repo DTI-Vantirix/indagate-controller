@@ -1,4 +1,5 @@
 use crate::hal::actuator_command_journal::{ActuatorCommandJournal, ReserveResult};
+use crate::hal::credential_rotation_journal::{CredentialRotationJournal, RotationReservation};
 use crate::hal::network_command_journal::NetworkCommandJournal;
 use crate::hal::network_manager;
 use crate::hal::telemetry;
@@ -682,6 +683,7 @@ async fn handle_command(
     relay_tx: &mpsc::Sender<RelayCommand>,
     journal: &NetworkCommandJournal,
     actuator_journal: &mut ActuatorCommandJournal,
+    rotation_journal: &mut CredentialRotationJournal,
 ) -> Result<()> {
     // Guarded commands are never executed, even if journaling or cloud ACK fails.
     // Persist the failure first, then use the retryable outbox.
@@ -709,8 +711,15 @@ async fn handle_command(
     acknowledge_command(identity, &command.id, "acknowledged", json!({}), None).await?;
 
     if command.command_type == "credential_rotate" {
-        rotate_device_credential(identity, &command.id).await?;
-
+        // Persist this identifier before contacting rotate/prepare.
+        // A lost reply or process crash must never trigger another prepare.
+        match rotation_journal.reserve(&command.id)? {
+            RotationReservation::New => rotate_device_credential(identity, &command.id).await?,
+            RotationReservation::AlreadyReserved => {
+                warn!(command_id = %command.id, "Credential rotation requires reconciliation; refusing duplicate prepare");
+            }
+            RotationReservation::AlreadyCompleted => {}
+        }
         return Ok(());
     }
 
@@ -1041,13 +1050,22 @@ async fn poll_commands(
     relay_tx: &mpsc::Sender<RelayCommand>,
     journal: &NetworkCommandJournal,
     actuator_journal: &mut ActuatorCommandJournal,
+    rotation_journal: &mut CredentialRotationJournal,
 ) -> Result<()> {
     let envelope = authenticated_get(identity, "/v1/commands").await?;
 
     let list: CommandList = serde_json::from_value(envelope.data)?;
 
     for command in list.commands {
-        if let Err(e) = handle_command(identity, command, relay_tx, journal, actuator_journal).await
+        if let Err(e) = handle_command(
+            identity,
+            command,
+            relay_tx,
+            journal,
+            actuator_journal,
+            rotation_journal,
+        )
+        .await
         {
             warn!(
                 error = %e,
@@ -1682,6 +1700,25 @@ pub async fn run(db_path: &str, relay_tx: mpsc::Sender<RelayCommand>) {
         _ => {}
     }
 
+    let mut rotation_journal = match CredentialRotationJournal::open(&journal_path) {
+        Ok(journal) => journal,
+        Err(e) => {
+            error!(error = %e, "Credential rotation journal unavailable; cloud agent disabled");
+            return;
+        }
+    };
+    match rotation_journal.unresolved() {
+        Ok(ids) if !ids.is_empty() => warn!(
+            count = ids.len(),
+            "Unresolved credential rotation reservations require reconciliation"
+        ),
+        Err(e) => {
+            error!(error = %e, "Credential rotation reconciliation unavailable; cloud agent disabled");
+            return;
+        }
+        _ => {}
+    }
+
     info!(
         controller_id = %identity.controller_id,
         "Nexus cloud agent started"
@@ -1694,8 +1731,19 @@ pub async fn run(db_path: &str, relay_tx: mpsc::Sender<RelayCommand>) {
         );
 
         loop {
+            // Only after authenticated commit and command ACK succeed may the
+            // journal reservation become terminal. The pending identity is the
+            // authoritative recovery record for the credential itself.
+            let pending_command_id = identity.pending_rotation_command_id.clone();
             match finalize_pending_credential_rotation(&mut identity).await {
-                Ok(_) => break,
+                Ok(_) => {
+                    if let Some(id) = pending_command_id {
+                        if let Err(e) = rotation_journal.mark_completed(&id) {
+                            warn!(error = %e, "Credential rotation finalized but journal reconciliation failed");
+                        }
+                    }
+                    break;
+                }
 
                 Err(e) => {
                     warn!(
@@ -1770,6 +1818,7 @@ pub async fn run(db_path: &str, relay_tx: mpsc::Sender<RelayCommand>) {
                         &relay_tx,
                         &network_journal,
                         &mut actuator_journal,
+                        &mut rotation_journal,
                     )
                     .await
                 {

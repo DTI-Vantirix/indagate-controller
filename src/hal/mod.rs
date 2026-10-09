@@ -14,6 +14,7 @@ pub mod network_checkpoint;
 
 pub mod actuator_command_journal;
 pub mod command_reconciliation;
+pub mod credential_rotation_journal;
 pub mod network_command_journal;
 pub mod network_live;
 pub mod network_safety;
