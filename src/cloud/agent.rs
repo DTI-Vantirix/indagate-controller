@@ -946,11 +946,34 @@ async fn handle_command(
     Ok(())
 }
 
+/// Deliver every pending result in the bounded batch, even if an earlier ACK fails.
+/// A failure never marks its result delivered; the existing journal retries it.
+/// No actuator or network command is executed during delivery.
+async fn deliver_ack_batch<T, F, Fut>(items: Vec<T>, mut deliver: F) -> Result<()>
+where
+    F: FnMut(T) -> Fut,
+    Fut: std::future::Future<Output = Result<()>>,
+{
+    let mut failed = 0usize;
+    for item in items {
+        if deliver(item).await.is_err() {
+            failed += 1;
+        }
+    }
+    if failed != 0 {
+        return Err(anyhow!(
+            "{} deferred acknowledgements could not be delivered",
+            failed
+        ));
+    }
+    Ok(())
+}
+
 async fn flush_actuator_acks(
     identity: &DeviceIdentity,
     journal: &ActuatorCommandJournal,
 ) -> Result<()> {
-    for report in journal.unreported(25)? {
+    deliver_ack_batch(journal.unreported(25)?, |report| async move {
         acknowledge_command(
             identity,
             &report.command_id,
@@ -960,8 +983,9 @@ async fn flush_actuator_acks(
         )
         .await?;
         journal.mark_reported(&report.command_id)?;
-    }
-    Ok(())
+        Ok(())
+    })
+    .await
 }
 
 const GUARDED_NETWORK_FAILURE: &str =
@@ -971,18 +995,22 @@ async fn flush_guarded_network_acks(
     identity: &DeviceIdentity,
     journal: &NetworkCommandJournal,
 ) -> Result<()> {
-    for command_id in journal.pending_guarded_rejections(25)? {
-        acknowledge_command(
-            identity,
-            &command_id,
-            "failed",
-            json!({}),
-            Some(GUARDED_NETWORK_FAILURE),
-        )
-        .await?;
-        journal.mark_guarded_rejection_reported(&command_id)?;
-    }
-    Ok(())
+    deliver_ack_batch(
+        journal.pending_guarded_rejections(25)?,
+        |command_id| async move {
+            acknowledge_command(
+                identity,
+                &command_id,
+                "failed",
+                json!({}),
+                Some(GUARDED_NETWORK_FAILURE),
+            )
+            .await?;
+            journal.mark_guarded_rejection_reported(&command_id)?;
+            Ok(())
+        },
+    )
+    .await
 }
 
 async fn poll_commands(
@@ -1774,5 +1802,59 @@ mod network_command_guard_tests {
     #[test]
     fn permits_wifi_radio_enable() {
         assert!(!network_command_requires_protection("wifi_radio_enable"));
+    }
+}
+
+#[cfg(test)]
+mod deferred_ack_delivery_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    #[tokio::test]
+    async fn failed_first_ack_does_not_starve_later_results() {
+        let delivered = Arc::new(Mutex::new(Vec::<u32>::new()));
+        let seen = Arc::clone(&delivered);
+        let result = deliver_ack_batch(vec![1u32, 2, 3], move |id| {
+            let seen = Arc::clone(&seen);
+            async move {
+                seen.lock().unwrap().push(id);
+                if id == 1 {
+                    Err(anyhow!("mock HTTP failure"))
+                } else {
+                    Ok(())
+                }
+            }
+        })
+        .await;
+        assert!(result.is_err());
+        assert_eq!(*delivered.lock().unwrap(), vec![1, 2, 3]);
+    }
+
+    #[tokio::test]
+    async fn all_successful_acks_complete_batch() {
+        let result = deliver_ack_batch(vec![1u32, 2, 3], |_id| async { Ok(()) }).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn all_failed_acks_return_batch_error() {
+        let attempted = Arc::new(Mutex::new(0usize));
+        let seen = Arc::clone(&attempted);
+        let result = deliver_ack_batch(vec![1u32, 2], move |_id| {
+            let seen = Arc::clone(&seen);
+            async move {
+                *seen.lock().unwrap() += 1;
+                Err(anyhow!("mock delivery failure"))
+            }
+        })
+        .await;
+        assert!(result.is_err());
+        assert_eq!(*attempted.lock().unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn empty_ack_batch_is_successful() {
+        let result = deliver_ack_batch(Vec::<u32>::new(), |_id| async { Ok(()) }).await;
+        assert!(result.is_ok());
     }
 }
