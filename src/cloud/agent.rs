@@ -1,3 +1,4 @@
+use crate::hal::network_command_journal::NetworkCommandJournal;
 use crate::hal::network_manager;
 use crate::hal::telemetry;
 use anyhow::{Context, Result, anyhow};
@@ -648,7 +649,15 @@ async fn handle_command(
     identity: &DeviceIdentity,
     command: DeviceCommand,
     relay_tx: &mpsc::Sender<RelayCommand>,
+    journal: &NetworkCommandJournal,
 ) -> Result<()> {
+    // Guarded commands are never executed, even if journaling or cloud ACK fails.
+    // Persist the failure first, then use the retryable outbox.
+    if network_command_requires_protection(&command.command_type) {
+        journal.record_guarded_rejection(&command.id)?;
+        return Ok(());
+    }
+
     acknowledge_command(identity, &command.id, "acknowledged", json!({}), None).await?;
 
     if command.command_type == "credential_rotate" {
@@ -905,16 +914,38 @@ async fn handle_command(
     Ok(())
 }
 
+const GUARDED_NETWORK_FAILURE: &str =
+    "network configuration command disabled until protected switching is implemented";
+
+async fn flush_guarded_network_acks(
+    identity: &DeviceIdentity,
+    journal: &NetworkCommandJournal,
+) -> Result<()> {
+    for command_id in journal.pending_guarded_rejections(25)? {
+        acknowledge_command(
+            identity,
+            &command_id,
+            "failed",
+            json!({}),
+            Some(GUARDED_NETWORK_FAILURE),
+        )
+        .await?;
+        journal.mark_guarded_rejection_reported(&command_id)?;
+    }
+    Ok(())
+}
+
 async fn poll_commands(
     identity: &DeviceIdentity,
     relay_tx: &mpsc::Sender<RelayCommand>,
+    journal: &NetworkCommandJournal,
 ) -> Result<()> {
     let envelope = authenticated_get(identity, "/v1/commands").await?;
 
     let list: CommandList = serde_json::from_value(envelope.data)?;
 
     for command in list.commands {
-        if let Err(e) = handle_command(identity, command, relay_tx).await {
+        if let Err(e) = handle_command(identity, command, relay_tx, journal).await {
             warn!(
                 error = %e,
                 "Nexus command handling failed"
@@ -1517,6 +1548,16 @@ pub async fn run(db_path: &str, relay_tx: mpsc::Sender<RelayCommand>) {
         }
     };
 
+    let journal_path = std::path::PathBuf::from(db_path).with_extension("network-commands.sqlite");
+    let network_journal = match NetworkCommandJournal::open(&journal_path) {
+        Ok(journal) => journal,
+        Err(e) => {
+            // Fail closed: never dispatch cloud commands with uncertain journal state.
+            error!(error = %e, "Network command journal unavailable; cloud agent disabled");
+            return;
+        }
+    };
+
     info!(
         controller_id = %identity.controller_id,
         "Nexus cloud agent started"
@@ -1592,10 +1633,15 @@ pub async fn run(db_path: &str, relay_tx: mpsc::Sender<RelayCommand>) {
             }
 
             _ = command_timer.tick() => {
+                if let Err(e) = flush_guarded_network_acks(&identity, &network_journal).await {
+                    warn!(error = %e, "Deferred network rejection acknowledgement failed");
+                }
+
                 if let Err(e) =
                     poll_commands(
                         &identity,
                         &relay_tx,
+                        &network_journal,
                     )
                     .await
                 {
