@@ -139,6 +139,16 @@ async fn main() -> Result<()> {
     let db_path =
         std::env::var("NEXUS_DB_PATH").unwrap_or_else(|_| storage::DEFAULT_DB_PATH.to_string());
 
+    // Local read-only inspection of persisted command outcomes. This must run
+    // before opening hardware or launching any of the controller's tasks.
+    if args.get(1).map(String::as_str) == Some("journal-status") {
+        let journal_path =
+            std::path::PathBuf::from(&db_path).with_extension("network-commands.sqlite");
+        let report = hal::command_reconciliation::inspect(&journal_path)?;
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+
     let db = storage::NexusDatabase::open(&db_path)?;
 
     db.set_config("hardware_model", profile.model)?;
