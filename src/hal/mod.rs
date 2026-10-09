@@ -11,3 +11,5 @@ pub mod telemetry;
 pub mod network_manager;
 
 pub mod network_checkpoint;
+
+pub mod network_transaction;
