@@ -112,9 +112,13 @@ fn validate_rollback_response(response: &str) -> Result<()> {
         let device = entry[0].trim_matches('"');
         let status: u32 = entry[1].parse()?;
 
-        validate_object_path(device)?;
-        if !device.starts_with("/org/freedesktop/NetworkManager/Devices/") {
-            return Err(anyhow!("rollback response contains unexpected device path"));
+        // NetworkManager may return the interface name as the dictionary key.
+        // Accept only the target Wi-Fi device or a validated device object path.
+        if device != "wlan0" {
+            validate_object_path(device)?;
+            if !device.starts_with("/org/freedesktop/NetworkManager/Devices/") {
+                return Err(anyhow!("rollback response contains unexpected device"));
+            }
         }
 
         if status != 0 {
@@ -203,6 +207,16 @@ mod tests {
             validate_rollback_response(r#"a{su} 1 "/org/freedesktop/NetworkManager/Devices/4" 0"#)
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn accepts_interface_name_rollback_response() {
+        assert!(validate_rollback_response(r#"a{su} 1 "wlan0" 0"#).is_ok());
+    }
+
+    #[test]
+    fn rejects_other_interface_rollback_response() {
+        assert!(validate_rollback_response(r#"a{su} 1 "eth0" 0"#).is_err());
     }
 
     #[test]
