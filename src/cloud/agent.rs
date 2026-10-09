@@ -653,206 +653,215 @@ async fn handle_command(
         return Ok(());
     }
 
-    let result = match command.command_type.as_str() {
-        "diagnostic_request" => Ok(json!({
-            "message": "diagnostic request acknowledged"
-        })),
+    let result: Result<Value> = async {
+        match command.command_type.as_str() {
+            "diagnostic_request" => Ok(json!({
+                "message": "diagnostic request acknowledged"
+            })),
 
-        "controller_sync" => Ok(json!({
-            "message": "configuration synchronization requested"
-        })),
+            "controller_sync" => Ok(json!({
+                "message": "configuration synchronization requested"
+            })),
 
-        "wifi_status" => tokio::task::spawn_blocking(network_manager::wifi_status)
-            .await
-            .map_err(|e| anyhow!("wifi status task failed: {}", e))?,
+            "wifi_status" => tokio::task::spawn_blocking(network_manager::wifi_status)
+                .await
+                .map_err(|e| anyhow!("wifi status task failed: {}", e))?,
 
-        "wifi_radio_enable" => tokio::task::spawn_blocking(network_manager::wifi_radio_enable)
-            .await
-            .map_err(|e| anyhow!("wifi radio task failed: {}", e))?,
+            "wifi_radio_enable" => tokio::task::spawn_blocking(network_manager::wifi_radio_enable)
+                .await
+                .map_err(|e| anyhow!("wifi radio task failed: {}", e))?,
 
-        "wifi_scan" => tokio::task::spawn_blocking(network_manager::wifi_scan)
-            .await
-            .map_err(|e| anyhow!("wifi scan task failed: {}", e))?,
+            "wifi_scan" => tokio::task::spawn_blocking(network_manager::wifi_scan)
+                .await
+                .map_err(|e| anyhow!("wifi scan task failed: {}", e))?,
 
-        "wifi_disconnect" => tokio::task::spawn_blocking(network_manager::wifi_disconnect)
-            .await
-            .map_err(|e| anyhow!("wifi disconnect task failed: {}", e))?,
+            "wifi_disconnect" => tokio::task::spawn_blocking(network_manager::wifi_disconnect)
+                .await
+                .map_err(|e| anyhow!("wifi disconnect task failed: {}", e))?,
 
-        "wifi_activate_saved" => {
-            let profile_name = command.payload["profile_name"]
-                .as_str()
-                .ok_or_else(|| anyhow!("wifi_activate_saved missing profile_name"))?
-                .to_string();
+            "wifi_activate_saved" => {
+                let profile_name = command.payload["profile_name"]
+                    .as_str()
+                    .ok_or_else(|| anyhow!("wifi_activate_saved missing profile_name"))?
+                    .to_string();
 
-            tokio::task::spawn_blocking(move || network_manager::wifi_activate_saved(&profile_name))
+                tokio::task::spawn_blocking(move || {
+                    network_manager::wifi_activate_saved(&profile_name)
+                })
                 .await
                 .map_err(|e| anyhow!("wifi activation task failed: {}", e))?
-        }
+            }
 
-        "controller_restart" => {
-            // Deliberately do not reboot directly from a cloud message
-            // during development. The command path is proven without
-            // making a remote command capable of unexpectedly restarting
-            // the lab controller.
-            Ok(json!({
-                "message":
-                    "restart command received; restart execution disabled in development"
-            }))
-        }
-
-        "door_hold_open" => {
-            let channel = command.payload["channel"]
-                .as_u64()
-                .ok_or_else(|| anyhow!("door_hold_open missing channel"))?;
-
-            if channel > 3 {
-                Err(anyhow!("invalid relay channel"))
-            } else {
-                let expires_at = match command.payload.get("expires_at").and_then(|v| v.as_str()) {
-                    Some(value) => Some(
-                        chrono::DateTime::parse_from_rfc3339(value)?.with_timezone(&chrono::Utc),
-                    ),
-
-                    None => None,
-                };
-
-                let (tx, rx) = oneshot::channel();
-
-                relay_tx
-                    .send(RelayCommand::SetOverride {
-                        channel: channel as u8,
-                        mode: DoorOverrideMode::HoldUnlocked,
-                        expires_at,
-                        response: tx,
-                    })
-                    .await?;
-
-                rx.await
-                    .map_err(|_| anyhow!("relay worker dropped override response"))?
-                    .map_err(anyhow::Error::msg)?;
-
+            "controller_restart" => {
+                // Deliberately do not reboot directly from a cloud message
+                // during development. The command path is proven without
+                // making a remote command capable of unexpectedly restarting
+                // the lab controller.
                 Ok(json!({
-                    "channel": channel,
-                    "mode": "hold_unlocked",
-                    "expires_at":
-                        expires_at.map(
-                            |x| x.to_rfc3339()
-                        )
+                    "message":
+                        "restart command received; restart execution disabled in development"
                 }))
             }
-        }
 
-        "door_lock" => {
-            let channel = command.payload["channel"]
-                .as_u64()
-                .ok_or_else(|| anyhow!("door_lock missing channel"))?;
+            "door_hold_open" => {
+                let channel = command.payload["channel"]
+                    .as_u64()
+                    .ok_or_else(|| anyhow!("door_hold_open missing channel"))?;
 
-            if channel > 3 {
-                Err(anyhow!("invalid relay channel"))
-            } else {
-                let expires_at = match command.payload.get("expires_at").and_then(|v| v.as_str()) {
-                    Some(value) => Some(
-                        chrono::DateTime::parse_from_rfc3339(value)?.with_timezone(&chrono::Utc),
-                    ),
+                if channel > 3 {
+                    Err(anyhow!("invalid relay channel"))
+                } else {
+                    let expires_at =
+                        match command.payload.get("expires_at").and_then(|v| v.as_str()) {
+                            Some(value) => Some(
+                                chrono::DateTime::parse_from_rfc3339(value)?
+                                    .with_timezone(&chrono::Utc),
+                            ),
 
-                    None => None,
-                };
+                            None => None,
+                        };
 
-                let (tx, rx) = oneshot::channel();
+                    let (tx, rx) = oneshot::channel();
 
-                relay_tx
-                    .send(RelayCommand::SetOverride {
-                        channel: channel as u8,
-                        mode: DoorOverrideMode::ForceLocked,
-                        expires_at,
-                        response: tx,
-                    })
-                    .await?;
+                    relay_tx
+                        .send(RelayCommand::SetOverride {
+                            channel: channel as u8,
+                            mode: DoorOverrideMode::HoldUnlocked,
+                            expires_at,
+                            response: tx,
+                        })
+                        .await?;
 
-                rx.await
-                    .map_err(|_| anyhow!("relay worker dropped override response"))?
-                    .map_err(anyhow::Error::msg)?;
+                    rx.await
+                        .map_err(|_| anyhow!("relay worker dropped override response"))?
+                        .map_err(anyhow::Error::msg)?;
 
-                Ok(json!({
-                    "channel": channel,
-                    "mode": "force_locked",
-                    "expires_at":
-                        expires_at.map(
-                            |x| x.to_rfc3339()
-                        )
-                }))
-            }
-        }
-
-        "door_return_to_schedule" => {
-            let channel = command.payload["channel"]
-                .as_u64()
-                .ok_or_else(|| anyhow!("door_return_to_schedule missing channel"))?;
-
-            if channel > 3 {
-                Err(anyhow!("invalid relay channel"))
-            } else {
-                let (tx, rx) = oneshot::channel();
-
-                relay_tx
-                    .send(RelayCommand::ClearOverride {
-                        channel: channel as u8,
-                        response: tx,
-                    })
-                    .await?;
-
-                rx.await
-                    .map_err(|_| anyhow!("relay worker dropped clear response"))?
-                    .map_err(anyhow::Error::msg)?;
-
-                Ok(json!({
-                    "channel": channel,
-                    "mode": "normal_schedule"
-                }))
-            }
-        }
-
-        "relay_pulse" => {
-            let channel = command.payload["channel"]
-                .as_u64()
-                .ok_or_else(|| anyhow!("relay_pulse missing channel"))?;
-
-            let duration_ms = command.payload["duration_ms"]
-                .as_u64()
-                .unwrap_or(5000)
-                .clamp(100, 60000);
-
-            if channel > 3 {
-                Err(anyhow!("invalid relay channel"))
-            } else {
-                let (tx, rx) = oneshot::channel();
-
-                relay_tx
-                    .send(RelayCommand::Pulse {
-                        channel: channel as u8,
-                        duration_ms,
-                        response: Some(tx),
-                    })
-                    .await?;
-
-                match rx.await {
-                    Ok(Ok(())) => Ok(json!({
+                    Ok(json!({
                         "channel": channel,
-                        "duration_ms": duration_ms
-                    })),
-
-                    Ok(Err(reason)) => Err(anyhow!(reason)),
-
-                    Err(_) => Err(anyhow!("relay worker dropped pulse response")),
+                        "mode": "hold_unlocked",
+                        "expires_at":
+                            expires_at.map(
+                                |x| x.to_rfc3339()
+                            )
+                    }))
                 }
             }
-        }
 
-        _ => Err(anyhow!(
-            "unsupported device command {}",
-            command.command_type
-        )),
-    };
+            "door_lock" => {
+                let channel = command.payload["channel"]
+                    .as_u64()
+                    .ok_or_else(|| anyhow!("door_lock missing channel"))?;
+
+                if channel > 3 {
+                    Err(anyhow!("invalid relay channel"))
+                } else {
+                    let expires_at =
+                        match command.payload.get("expires_at").and_then(|v| v.as_str()) {
+                            Some(value) => Some(
+                                chrono::DateTime::parse_from_rfc3339(value)?
+                                    .with_timezone(&chrono::Utc),
+                            ),
+
+                            None => None,
+                        };
+
+                    let (tx, rx) = oneshot::channel();
+
+                    relay_tx
+                        .send(RelayCommand::SetOverride {
+                            channel: channel as u8,
+                            mode: DoorOverrideMode::ForceLocked,
+                            expires_at,
+                            response: tx,
+                        })
+                        .await?;
+
+                    rx.await
+                        .map_err(|_| anyhow!("relay worker dropped override response"))?
+                        .map_err(anyhow::Error::msg)?;
+
+                    Ok(json!({
+                        "channel": channel,
+                        "mode": "force_locked",
+                        "expires_at":
+                            expires_at.map(
+                                |x| x.to_rfc3339()
+                            )
+                    }))
+                }
+            }
+
+            "door_return_to_schedule" => {
+                let channel = command.payload["channel"]
+                    .as_u64()
+                    .ok_or_else(|| anyhow!("door_return_to_schedule missing channel"))?;
+
+                if channel > 3 {
+                    Err(anyhow!("invalid relay channel"))
+                } else {
+                    let (tx, rx) = oneshot::channel();
+
+                    relay_tx
+                        .send(RelayCommand::ClearOverride {
+                            channel: channel as u8,
+                            response: tx,
+                        })
+                        .await?;
+
+                    rx.await
+                        .map_err(|_| anyhow!("relay worker dropped clear response"))?
+                        .map_err(anyhow::Error::msg)?;
+
+                    Ok(json!({
+                        "channel": channel,
+                        "mode": "normal_schedule"
+                    }))
+                }
+            }
+
+            "relay_pulse" => {
+                let channel = command.payload["channel"]
+                    .as_u64()
+                    .ok_or_else(|| anyhow!("relay_pulse missing channel"))?;
+
+                let duration_ms = command.payload["duration_ms"]
+                    .as_u64()
+                    .unwrap_or(5000)
+                    .clamp(100, 60000);
+
+                if channel > 3 {
+                    Err(anyhow!("invalid relay channel"))
+                } else {
+                    let (tx, rx) = oneshot::channel();
+
+                    relay_tx
+                        .send(RelayCommand::Pulse {
+                            channel: channel as u8,
+                            duration_ms,
+                            response: Some(tx),
+                        })
+                        .await?;
+
+                    match rx.await {
+                        Ok(Ok(())) => Ok(json!({
+                            "channel": channel,
+                            "duration_ms": duration_ms
+                        })),
+
+                        Ok(Err(reason)) => Err(anyhow!(reason)),
+
+                        Err(_) => Err(anyhow!("relay worker dropped pulse response")),
+                    }
+                }
+            }
+
+            _ => Err(anyhow!(
+                "unsupported device command {}",
+                command.command_type
+            )),
+        }
+    }
+    .await;
 
     match result {
         Ok(result) => {
