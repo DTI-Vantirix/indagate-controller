@@ -21,8 +21,6 @@ use tracing::{error, info, warn};
 use crate::hal::relay_worker::{DoorOverrideMode, RelayCommand};
 use crate::storage::ControllerDatabase;
 
-pub const DEFAULT_BASE_URL: &str =
-    "https://gxwfuurzkdhxwxdbtdmt.supabase.co/functions/v1/nexus-device";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeviceIdentity {
@@ -2166,7 +2164,7 @@ mod live_server_tests {
     //! Exercises this agent's own request code against a running cloud server.
     //!
     //! Ignored in a normal test run. To run it, start a server and set
-    //! `NEXUS_CLOUD_URL`, `NEXUS_TEST_DEVICE_ID` and `NEXUS_TEST_DEVICE_SECRET` for an enrolled
+    //! `INDAGATE_SERVER_URL` (or `NEXUS_CLOUD_URL`), `NEXUS_TEST_DEVICE_ID` and `NEXUS_TEST_DEVICE_SECRET` for an enrolled
     //! controller that has at least one command waiting, then:
     //!
     //! ```text

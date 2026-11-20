@@ -2,10 +2,10 @@
 //!
 //! Three things live here, all additive to the existing cloud agent:
 //!
-//! * **The server address.** `INDAGATE_SERVER_URL` replaces the built-in address. It must be
+//! * **The server address.** `INDAGATE_SERVER_URL`; there is no built-in address. It must be
 //!   `https://`, except for a loopback address, or when `INDAGATE_SERVER_ALLOW_PLAINTEXT=lab-only`
 //!   is set for bench work. A malformed value stops the cloud agent rather than falling back
-//!   to the built-in address: the device secret must never be sent to a server the operator
+//!   to anything else: the device secret must never be sent to a server the operator
 //!   did not intend. Local access control keeps working either way.
 //! * **Extra trusted certificate authorities.** `INDAGATE_SERVER_CA_FILE` names a PEM file whose
 //!   certificates are trusted *in addition to* the built-in public roots, so a self-hosted
@@ -41,10 +41,11 @@ fn is_loopback(url: &Url) -> bool {
     host.eq_ignore_ascii_case("localhost") || host.parse::<std::net::IpAddr>().is_ok_and(|address| address.is_loopback())
 }
 
-/// Decide the base address from the configured value (or the built-in one when unset).
-fn resolve_base_url(configured: Option<&str>, allow_plaintext: bool, built_in: &str) -> Result<String> {
+/// Decide the base address from the configured value. There is no built-in address: with
+/// none configured the controller does not talk to a server at all.
+fn resolve_base_url(configured: Option<&str>, allow_plaintext: bool) -> Result<String> {
     let Some(raw) = configured.map(str::trim).filter(|v| !v.is_empty()) else {
-        return Ok(built_in.to_string());
+        return Err(anyhow!("INDAGATE_SERVER_URL is not set"));
     };
     let url = Url::parse(raw).map_err(|_| anyhow!("INDAGATE_SERVER_URL is not a valid URL"))?;
     if url.host().is_none() || url.cannot_be_a_base() {
@@ -84,13 +85,19 @@ fn pick_setting(new: Option<String>, old: Option<String>) -> Option<String> {
     new.filter(|v| !v.trim().is_empty()).or(old)
 }
 
+/// The extra certificate authority file, if one is configured (for tools that make their own
+/// connections to the server).
+pub fn ca_file() -> Option<String> {
+    setting("CA_FILE").map(|p| p.trim().to_string()).filter(|p| !p.is_empty())
+}
+
 /// The address every cloud request is built on, decided once per process.
 pub fn base_url() -> Result<&'static str> {
     static BASE: OnceLock<std::result::Result<String, String>> = OnceLock::new();
     BASE.get_or_init(|| {
         let configured = setting("URL");
         let allow_plaintext = setting("ALLOW_PLAINTEXT").as_deref() == Some("lab-only");
-        resolve_base_url(configured.as_deref(), allow_plaintext, super::agent::DEFAULT_BASE_URL)
+        resolve_base_url(configured.as_deref(), allow_plaintext)
             .map_err(|e| e.to_string())
     })
     .as_deref()
@@ -285,7 +292,6 @@ pub async fn run_stream(device_id: String, device_secret: String, nudges: mpsc::
 mod tests {
     use super::*;
 
-    const BUILT_IN: &str = "https://built-in.example/functions/v1/nexus-device";
 
     #[test]
     fn the_new_setting_name_wins_and_the_old_one_still_works() {
@@ -295,34 +301,34 @@ mod tests {
         assert_eq!(pick_setting(None, None), None);
         // An empty new value counts as not set; a malformed one is reported, not replaced.
         assert_eq!(pick_setting(s(" "), s("https://old.example")), s("https://old.example"));
-        assert!(resolve_base_url(pick_setting(s("not a url"), s("https://old.example")).as_deref(), false, BUILT_IN).is_err());
+        assert!(resolve_base_url(pick_setting(s("not a url"), s("https://old.example")).as_deref(), false).is_err());
     }
 
     #[test]
-    fn unset_address_uses_the_built_in_one() {
-        assert_eq!(resolve_base_url(None, false, BUILT_IN).unwrap(), BUILT_IN);
-        assert_eq!(resolve_base_url(Some("   "), false, BUILT_IN).unwrap(), BUILT_IN);
+    fn an_unset_address_is_an_error_not_a_default() {
+        assert!(resolve_base_url(None, false).is_err());
+        assert!(resolve_base_url(Some("   "), false).is_err());
     }
 
     #[test]
     fn https_addresses_are_accepted_and_tidied() {
         assert_eq!(
-            resolve_base_url(Some(" https://access.example.com/ "), false, BUILT_IN).unwrap(),
+            resolve_base_url(Some(" https://access.example.com/ "), false).unwrap(),
             "https://access.example.com"
         );
         assert_eq!(
-            resolve_base_url(Some("https://access.example.com:8443/functions/v1/nexus-device"), false, BUILT_IN).unwrap(),
+            resolve_base_url(Some("https://access.example.com:8443/functions/v1/nexus-device"), false).unwrap(),
             "https://access.example.com:8443/functions/v1/nexus-device"
         );
     }
 
     #[test]
     fn plaintext_is_only_for_loopback_or_explicit_lab_use() {
-        assert!(resolve_base_url(Some("http://127.0.0.1:8080"), false, BUILT_IN).is_ok());
-        assert!(resolve_base_url(Some("http://localhost:8080"), false, BUILT_IN).is_ok());
-        assert!(resolve_base_url(Some("http://[::1]:8080"), false, BUILT_IN).is_ok());
-        assert!(resolve_base_url(Some("http://192.168.1.20:8080"), false, BUILT_IN).is_err());
-        assert!(resolve_base_url(Some("http://192.168.1.20:8080"), true, BUILT_IN).is_ok());
+        assert!(resolve_base_url(Some("http://127.0.0.1:8080"), false).is_ok());
+        assert!(resolve_base_url(Some("http://localhost:8080"), false).is_ok());
+        assert!(resolve_base_url(Some("http://[::1]:8080"), false).is_ok());
+        assert!(resolve_base_url(Some("http://192.168.1.20:8080"), false).is_err());
+        assert!(resolve_base_url(Some("http://192.168.1.20:8080"), true).is_ok());
     }
 
     #[test]
@@ -335,7 +341,7 @@ mod tests {
             "https://access.example.com/#frag",
             "https://",
         ] {
-            assert!(resolve_base_url(Some(bad), true, BUILT_IN).is_err(), "{bad} should be refused");
+            assert!(resolve_base_url(Some(bad), true).is_err(), "{bad} should be refused");
         }
     }
 

@@ -1,4 +1,7 @@
 //! Optional, isolated cloud telemetry for Wiegand DIAGNOSTIC ONLY.
+//! Capture sessions are read from, and frames sent to, the configured Indagate server under
+//! `/v1/credential-capture`. The server does not offer that yet, so until it does the worker
+//! only reports that session discovery failed.
 //! Zero actuator imports. Does not change GPIO configuration or access rules.
 use serde::Deserialize;
 use serde_json::json;
@@ -7,8 +10,6 @@ use std::sync::mpsc::{self, RecvTimeoutError, SyncSender};
 use std::time::{Duration, Instant};
 use tracing::{info, warn};
 
-const API_URL: &str =
-    "https://gxwfuurzkdhxwxdbtdmt.supabase.co/functions/v1/nexus-credential-identifier";
 
 #[derive(Debug)]
 pub struct CaptureFrame {
@@ -89,6 +90,13 @@ pub fn start() -> Option<SyncSender<CaptureFrame>> {
             return None;
         }
     };
+    let api_url = match crate::cloud::endpoint::base_url() {
+        Ok(base) => format!("{base}/v1/credential-capture"),
+        Err(err) => {
+            warn!(target: "indagate_v23_capture", error=%err, "Capture upload disabled: no server address");
+            return None;
+        }
+    };
     // Bounded and non-blocking sender protects the timing-sensitive GPIO poll loop.
     let (tx, rx) = mpsc::sync_channel::<CaptureFrame>(256);
     std::thread::spawn(move || {
@@ -119,8 +127,10 @@ pub fn start() -> Option<SyncSender<CaptureFrame>> {
             if last_lookup.elapsed() >= Duration::from_secs(5) {
                 let result = rt.block_on(async {
                     let response = client
-                        .get(format!("{API_URL}/active"))
+                        .get(format!("{api_url}/active"))
+                        .header("x-indagate-device-id", &identity.device_id)
                         .header("x-nexus-device-id", &identity.device_id)
+                        .header("x-indagate-device-secret", &identity.device_secret)
                         .header("x-nexus-device-secret", &identity.device_secret)
                         .send()
                         .await?;
@@ -167,8 +177,10 @@ pub fn start() -> Option<SyncSender<CaptureFrame>> {
                         "raw_bits":frame.raw_bits,"bit_count":frame.raw_bits.len(),"overflow":frame.overflow});
                     let result = rt.block_on(async {
                         let response = client
-                            .post(format!("{API_URL}/capture"))
+                            .post(format!("{api_url}/capture"))
+                            .header("x-indagate-device-id", &identity.device_id)
                             .header("x-nexus-device-id", &identity.device_id)
+                            .header("x-indagate-device-secret", &identity.device_secret)
                             .header("x-nexus-device-secret", &identity.device_secret)
                             .json(&body)
                             .send()

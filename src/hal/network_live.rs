@@ -8,7 +8,6 @@ use anyhow::{Context, Result, anyhow};
 use std::path::Path;
 use std::time::Duration;
 
-const CLOUD_URL: &str = "https://gxwfuurzkdhxwxdbtdmt.supabase.co/functions/v1/nexus-device";
 
 fn command(program: &str, args: &[&str]) -> Result<String> {
     bounded_command(program, args, Duration::from_secs(25))
@@ -33,24 +32,31 @@ fn verify_uuid(expected: &str, observed: &str) -> Result<()> {
 fn verify_wifi_https() -> Result<()> {
     // CURLOPT_INTERFACE equivalent pins outbound traffic to wlan0.
     // Do not use --insecure, and do not follow redirects.
-    let status = command(
-        "curl",
-        &[
-            "--interface",
-            "wlan0",
-            "--connect-timeout",
-            "5",
-            "--max-time",
-            "12",
-            "--silent",
-            "--show-error",
-            "--output",
-            "/dev/null",
-            "--write-out",
-            "%{http_code}",
-            CLOUD_URL,
-        ],
-    )?;
+    // The probe goes to the configured Indagate server; without one there is nothing to
+    // prove reachable, so the check fails rather than contacting some other host.
+    let server = crate::cloud::endpoint::base_url().context("Wi-Fi HTTPS probe needs the server address")?;
+    let ca_file = crate::cloud::endpoint::ca_file();
+    let mut args = vec![
+        "--interface",
+        "wlan0",
+        "--connect-timeout",
+        "5",
+        "--max-time",
+        "12",
+        "--silent",
+        "--show-error",
+        "--output",
+        "/dev/null",
+        "--write-out",
+        "%{http_code}",
+    ];
+    if let Some(path) = ca_file.as_deref() {
+        // Trust the same private certificate authority the agent trusts.
+        args.push("--cacert");
+        args.push(path);
+    }
+    args.push(server);
+    let status = command("curl", &args)?;
     let status: u16 = status.parse().context("invalid HTTPS status response")?;
     // 401/403 are proof of TLS transport, NOT authentication.
     if !(200..500).contains(&status) {

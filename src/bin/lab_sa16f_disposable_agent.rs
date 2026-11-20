@@ -73,7 +73,11 @@ const CONTROLLER: &str = "93be1d68-170a-4564-a9b7-6c71817a0e2d";
 const DEVICE: &str = "e259087a-0647-41f4-82d7-6841513bc41c";
 const ORG: &str = "811b47e7-a529-4c2e-9f6b-4e0939825517";
 const SITE: &str = "1b6b02c7-fb83-44f0-8f43-d71f1caa8c68";
-const URL: &str = "https://gxwfuurzkdhxwxdbtdmt.supabase.co/functions/v1/nexus-device/v1/checkin";
+/// The server to call, from `INDAGATE_SERVER_URL`. There is no built-in address.
+fn checkin_url() -> String {
+    let base = std::env::var("INDAGATE_SERVER_URL").expect("set INDAGATE_SERVER_URL to the server address");
+    format!("{}/v1/checkin", base.trim_end_matches('/'))
+}
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -165,7 +169,7 @@ async fn checkin()->Result<()> {
         "network":{"primary":"sa16f-disposable"},
         "health":{"sa16f_disposable_agent":true,"sealed_identity_generation":generation},
     });
-    let resp=client.post(URL).header("x-nexus-device-id",DEVICE)
+    let resp=client.post(checkin_url()).header("x-nexus-device-id",DEVICE)
         .header("x-nexus-device-secret",&identity.device_secret)
         .json(&request).send().await.context("real cloud disposable check-in request")?;
     let status=resp.status();

@@ -24,7 +24,12 @@ const SITE: &str = "a96cb5a6-75f2-4f07-8232-7c405257cfbd";
 const PROFILE: &str = "HNX-HW-SP-ACP4WR6-R1";
 const BIN_SHA: &str = "c657b7df809da483a1b88812d6f19e974576fc185c6d72be388debb31595430f";
 const CONFIG_SHA: &str = "7a89bb687b6eaa823c5d69c45b32529c4991d8e3e561cff6572d1a80e95320f6";
-const ENDPOINT: &str = "https://gxwfuurzkdhxwxdbtdmt.supabase.co/functions/v1/nexus-device/v1/config";
+const ENDPOINT_PATH: &str = "/v1/config";
+/// The server to ask, from `INDAGATE_SERVER_URL`. There is no built-in address.
+fn endpoint() -> String {
+    let base = std::env::var("INDAGATE_SERVER_URL").expect("set INDAGATE_SERVER_URL to the server address");
+    format!("{}{ENDPOINT_PATH}", base.trim_end_matches('/'))
+}
 const IDENTITY: &str = "/var/lib/highline-nexus/device.json";
 const UNIT: &str = "highline-nexus-controller.service";
 const STAGE_ROOT: &str = "/var/lib/hlaxs/access-stage3c-bench";
@@ -186,7 +191,7 @@ fn validate_candidate(data: &Value) -> Result<()> {
 
 async fn fetch_config(identity: &Identity) -> Result<Value> {
     let client = reqwest::Client::builder().timeout(Duration::from_secs(15)).build()?;
-    let mut res = client.get(ENDPOINT)
+    let mut res = client.get(endpoint())
         .header("x-nexus-device-id", identity.device_id.as_str())
         .header("x-nexus-device-secret", identity.device_secret.as_str())
         .header("accept","application/json")
@@ -264,7 +269,7 @@ mod tests {
     }
     #[test] fn live_service_hash_and_nonactuating_guards_embedded() {
         assert_eq!(BIN_SHA.len(),64);
-        assert!(ENDPOINT.ends_with("/v1/config"));
+        assert!(ENDPOINT_PATH.ends_with("/v1/config"));
         assert!(STAGE_DB.contains("stage3c-bench"));
     }
 }
