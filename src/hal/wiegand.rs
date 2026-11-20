@@ -187,16 +187,6 @@ fn collect_edge_frames(
 }
 
 pub async fn run(profile: &BoardProfile, db_path: &str, relay_tx: mpsc::Sender<RelayCommand>) {
-    // Preserve explicit diagnostic-only behavior: never authorize or actuate in this mode.
-    if std::env::var("HLAXS_WIEGAND_EDGE_DIAGNOSTIC").as_deref() == Ok("1") {
-        let profile = profile.clone();
-        match tokio::task::spawn_blocking(move || super::wiegand_edge_diagnostic::run(&profile)).await {
-            Ok(Ok(())) => warn!("Diagnostic edge worker unexpectedly returned"),
-            Ok(Err(err)) => error!(error=%err, "Diagnostic edge worker stopped"),
-            Err(err) => error!(error=%err, "Diagnostic edge worker panicked"),
-        }
-        return;
-    }
 
     let db = match ControllerDatabase::open(db_path) {
         Ok(db) => db,

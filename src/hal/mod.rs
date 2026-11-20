@@ -1,6 +1,4 @@
 pub mod card_read;
-pub mod credential_capture;
-pub mod credential_formats;
 pub mod health;
 pub mod input;
 pub mod monitor;
@@ -9,7 +7,6 @@ pub mod profile;
 pub mod relay;
 pub mod relay_worker;
 pub mod wiegand;
-pub mod wiegand_edge_diagnostic;
 
 pub mod telemetry;
 
