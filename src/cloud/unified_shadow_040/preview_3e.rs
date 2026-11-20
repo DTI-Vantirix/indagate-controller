@@ -1,4 +1,4 @@
-//! HLAXS.Access Stage 3E — physical CAPTURE shadow classifier for signed v7 BENCH PREVIEW.
+//! Indagate Access Stage 3E — physical CAPTURE shadow classifier for signed v7 BENCH PREVIEW.
 //! Strictly a diagnostic in-memory data path. Nothing here can apply configurations,
 //! acknowledge a controller version, grant an unlock, operate GPIO/relay, or write a cache.
 //! A frame observed by the capture worker is NOT cryptographic reader attestation.

@@ -1,4 +1,4 @@
-//! HLAXS.Access developer-only simulated decision -> mock proposal -> memory sink.
+//! Indagate Access developer-only simulated decision -> mock proposal -> memory sink.
 //! NOT registered with controller main, cloud agent, HAL or any physical output.
 #[path = "../cloud/config_semantics.rs"]
 mod config_semantics;

@@ -1,4 +1,4 @@
-//! Offline-only reference access-decision evaluator for HLAXS.Access SP4.
+//! Offline-only reference access-decision evaluator for Indagate Access SP4.
 //! This file is NOT registered in cloud/mod.rs, agent.rs, or main.rs.
 //! No I/O, no device commands, no relay, no cloud ACK, no production database.
 //! It accepts a UTC test clock and a JSON configuration value; every result is

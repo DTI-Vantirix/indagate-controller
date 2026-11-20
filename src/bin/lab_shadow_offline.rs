@@ -1,4 +1,4 @@
-//! HLAXS.Access v6: standalone local shadow-store acceptance utility.
+//! Indagate Access v6: standalone local shadow-store acceptance utility.
 //! NEVER invokes the controller's main(), agent(), hardware drivers or cloud ACK.
 //! Only invoked explicitly from a WSL developer shell, not the SP4.
 

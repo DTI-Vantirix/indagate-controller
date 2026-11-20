@@ -19,7 +19,7 @@ use tokio::time::{MissedTickBehavior, interval};
 use tracing::{error, info, warn};
 
 use crate::hal::relay_worker::{DoorOverrideMode, RelayCommand};
-use crate::storage::NexusDatabase;
+use crate::storage::ControllerDatabase;
 
 pub const DEFAULT_BASE_URL: &str =
     "https://gxwfuurzkdhxwxdbtdmt.supabase.co/functions/v1/nexus-device";
@@ -232,7 +232,7 @@ fn api_error(envelope: &ApiEnvelope) -> anyhow::Error {
     if let Some(error) = &envelope.error {
         anyhow!("{}: {}", error.code, error.message)
     } else {
-        anyhow!("Nexus API request failed")
+        anyhow!("Indagate API request failed")
     }
 }
 
@@ -241,7 +241,7 @@ async fn parse_response(response: Response) -> Result<ApiEnvelope> {
     let body = response
         .json::<ApiEnvelope>()
         .await
-        .context("decode Nexus API response")?;
+        .context("decode Indagate API response")?;
 
     if !status.is_success() || !body.success {
         return Err(api_error(&body));
@@ -290,7 +290,7 @@ pub async fn enroll(enrollment_token: &str, hardware_serial: &str) -> Result<Dev
         .json(&body)
         .send()
         .await
-        .context("send Nexus enrollment")?;
+        .context("send Indagate enrollment")?;
 
     let envelope = parse_response(response).await?;
 
@@ -361,7 +361,7 @@ async fn finalize_pending_credential_rotation(identity: &mut DeviceIdentity) -> 
         }),
     )
     .await
-    .context("commit Nexus device credential rotation")?;
+    .context("commit Indagate device credential rotation")?;
 
     //
     // If this rotation originated from a device command, complete
@@ -395,8 +395,8 @@ async fn finalize_pending_credential_rotation(identity: &mut DeviceIdentity) -> 
     )?;
 
     info!(
-        target: "nexus_cloud",
-        "Nexus device credential rotation committed"
+        target: "indagate_cloud",
+        "Indagate device credential rotation committed"
     );
 
     Ok(true)
@@ -448,7 +448,7 @@ async fn rotate_device_credential(
     ensure_no_pending_rotation(identity)?;
     let prepared = authenticated_post(identity, "/v1/credential/rotate/prepare", json!({}))
         .await
-        .context("prepare Nexus device credential rotation")?;
+        .context("prepare Indagate device credential rotation")?;
 
     let (certificate_id, device_secret) = validate_rotation_prepare(&prepared.data)?;
 
@@ -486,15 +486,15 @@ async fn rotate_device_credential(
                 warn!(error = %e, "Credential rotation finalized but journal reconciliation failed");
             }
             info!(
-                target: "nexus_cloud",
+                target: "indagate_cloud",
                 certificate_id = %certificate_id,
-                "Device credential rotation complete; restarting Nexus agent"
+                "Device credential rotation complete; restarting Indagate agent"
             );
         }
 
         Err(e) => {
             warn!(
-                target: "nexus_cloud",
+                target: "indagate_cloud",
                 error = %e,
                 certificate_id = %certificate_id,
                 "Replacement credential persisted; rotation completion will retry after restart"
@@ -509,7 +509,7 @@ async fn rotate_device_credential(
     std::process::exit(75);
 }
 
-async fn checkin(identity: &DeviceIdentity, db: &NexusDatabase) -> Result<Value> {
+async fn checkin(identity: &DeviceIdentity, db: &ControllerDatabase) -> Result<Value> {
     let applied_version = db
         .connection()
         .query_row(
@@ -546,7 +546,7 @@ async fn checkin(identity: &DeviceIdentity, db: &NexusDatabase) -> Result<Value>
         .data)
 }
 
-async fn upload_events(identity: &DeviceIdentity, db: &NexusDatabase) -> Result<()> {
+async fn upload_events(identity: &DeviceIdentity, db: &ControllerDatabase) -> Result<()> {
     let mut stmt = db.connection().prepare(
         r#"
         SELECT
@@ -1072,7 +1072,7 @@ async fn poll_commands(
         {
             warn!(
                 error = %e,
-                "Nexus command handling failed"
+                "Indagate command handling failed"
             );
         }
     }
@@ -1333,7 +1333,7 @@ fn validate_cloud_configuration(config: &CloudConfiguration) -> Result<()> {
 }
 
 fn apply_cloud_configuration(
-    db: &NexusDatabase,
+    db: &ControllerDatabase,
     version: u64,
     checksum: Option<&str>,
     config: &CloudConfiguration,
@@ -1342,7 +1342,7 @@ fn apply_cloud_configuration(
 
     //
     // unchecked_transaction() is intentional here:
-    // NexusDatabase exposes &Connection and the cloud
+    // ControllerDatabase exposes &Connection and the cloud
     // agent owns this connection exclusively.
     //
     let tx = db
@@ -1604,7 +1604,7 @@ fn apply_cloud_configuration(
 
 async fn sync_config_if_needed(
     identity: &DeviceIdentity,
-    db: &NexusDatabase,
+    db: &ControllerDatabase,
     checkin_data: &Value,
 ) -> Result<()> {
     let update_available = checkin_data["config_update_available"]
@@ -1633,7 +1633,7 @@ async fn sync_config_if_needed(
         serde_json::from_value(configuration_value).context("decode cloud configuration")?;
 
     info!(
-        target: "nexus_cloud",
+        target: "indagate_cloud",
         version = version,
         "Cloud configuration downloaded"
     );
@@ -1656,7 +1656,7 @@ async fn sync_config_if_needed(
             .context("ack applied cloud configuration")?;
 
             info!(
-                target: "nexus_cloud",
+                target: "indagate_cloud",
                 version = version,
                 "Cloud configuration applied and acknowledged"
             );
@@ -1708,7 +1708,7 @@ pub async fn run(db_path: &str, relay_tx: mpsc::Sender<RelayCommand>) {
     // A mis-set cloud address stops the cloud agent (never a silent fallback to another
     // server); local access control is unaffected.
     match super::endpoint::base_url() {
-        Ok(url) => info!(target: "nexus_cloud", cloud_url = %url, "Nexus cloud address"),
+        Ok(url) => info!(target: "indagate_cloud", cloud_url = %url, "Indagate server address"),
         Err(e) => {
             error!(error = %e, "Cloud address is not usable; cloud agent disabled, local access remains operational");
             return;
@@ -1723,14 +1723,14 @@ pub async fn run(db_path: &str, relay_tx: mpsc::Sender<RelayCommand>) {
         Ok(Some(identity)) => identity,
 
         Ok(None) => {
-            warn!("Nexus cloud agent not enrolled; local access remains operational");
+            warn!("Indagate cloud agent not enrolled; local access remains operational");
             return;
         }
 
         Err(e) => {
             error!(
                 error = %e,
-                "Unable to load Nexus device identity"
+                "Unable to load Indagate device identity"
             );
             return;
         }
@@ -1748,14 +1748,14 @@ pub async fn run(db_path: &str, relay_tx: mpsc::Sender<RelayCommand>) {
         };
         match super::sa15i_identity_bridge::audit_metadata(view, None) {
             Ok(decision) => info!(
-                target: "nexus_cloud",
+                target: "indagate_cloud",
                 pending_recovery = matches!(decision.route, super::sa15i_identity_bridge::RecoveryRoute::PendingReplacementMustCommit),
                 synthetic_snapshot_checked = decision.synthetic_snapshot_checked,
                 live_migration_permitted = decision.live_migration_permitted,
                 "SA-15I read-only identity lifecycle audit (no migration)"
             ),
             Err(_) => warn!(
-                target: "nexus_cloud",
+                target: "indagate_cloud",
                 "SA-15I read-only identity metadata validation unavailable; live cloud flow unchanged"
             ),
         }
@@ -1768,13 +1768,13 @@ pub async fn run(db_path: &str, relay_tx: mpsc::Sender<RelayCommand>) {
         return;
     }
 
-    let db = match NexusDatabase::open(db_path) {
+    let db = match ControllerDatabase::open(db_path) {
         Ok(db) => db,
 
         Err(e) => {
             error!(
                 error = %e,
-                "Unable to open database for Nexus cloud agent"
+                "Unable to open database for Indagate cloud agent"
             );
             return;
         }
@@ -1832,12 +1832,12 @@ pub async fn run(db_path: &str, relay_tx: mpsc::Sender<RelayCommand>) {
 
     info!(
         controller_id = %identity.controller_id,
-        "Nexus cloud agent started"
+        "Indagate cloud agent started"
     );
 
     if identity.pending_certificate_id.is_some() {
         warn!(
-            target: "nexus_cloud",
+            target: "indagate_cloud",
             "Pending device credential rotation detected"
         );
 
@@ -1858,7 +1858,7 @@ pub async fn run(db_path: &str, relay_tx: mpsc::Sender<RelayCommand>) {
 
                 Err(e) => {
                     warn!(
-                        target: "nexus_cloud",
+                        target: "indagate_cloud",
                         error = %e,
                         "Unable to finish pending credential rotation; retrying"
                     );
@@ -1893,7 +1893,7 @@ pub async fn run(db_path: &str, relay_tx: mpsc::Sender<RelayCommand>) {
             nudge_tx,
         ));
     } else {
-        info!(target: "nexus_cloud", "Push stream disabled by NEXUS_CLOUD_PUSH; using timed polling only");
+        info!(target: "indagate_cloud", "Push stream disabled by NEXUS_CLOUD_PUSH; using timed polling only");
     }
 
     enum Work {
@@ -1923,7 +1923,7 @@ pub async fn run(db_path: &str, relay_tx: mpsc::Sender<RelayCommand>) {
                 match checkin(&identity, &db).await {
                     Ok(data) => {
                         info!(
-                            target: "nexus_cloud",
+                            target: "indagate_cloud",
                             "Cloud check-in successful"
                         );
 

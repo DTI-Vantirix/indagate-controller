@@ -25,8 +25,8 @@ mod test_clock {
 
 // Preserved copies of original source, with only the clock substitution.
 mod legacy {
-    pub mod schedule { include!("../cloud/hlaxs_policy_ref_schedule.rs"); }
-    pub mod engine { include!("../cloud/hlaxs_policy_ref_engine.rs"); }
+    pub mod schedule { include!("../cloud/policy_ref_schedule.rs"); }
+    pub mod engine { include!("../cloud/policy_ref_engine.rs"); }
 }
 
 const CONTROLLER: &str = "2722691f-f4db-4f42-b63d-dac94b06ec9e";
