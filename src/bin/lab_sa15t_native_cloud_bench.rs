@@ -1,4 +1,4 @@
-//! SA-15T: Native CAAM-backed real Supabase authentication with a disposable SA-15S identity.
+//! SA-15T: Native CAAM-backed real server authentication with a disposable SA-15S identity.
 //! STRICT TEST ONLY. Cannot read /var/lib/highline-nexus; no relay or live service interaction.
 //! Deliberately does NOT rotate credentials, claim commands, or modify controller cloud state.
 #[path = "../cloud/secret_envelope.rs"]
