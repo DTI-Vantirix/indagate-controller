@@ -286,6 +286,7 @@ pub async fn enroll(enrollment_token: &str, hardware_serial: &str) -> Result<Dev
 
     let response = client
         .post(format!("{}/v1/enroll", super::endpoint::base_url()?))
+        .header("x-indagate-enrollment-token", enrollment_token)
         .header("x-nexus-enrollment-token", enrollment_token)
         .json(&body)
         .send()
@@ -318,7 +319,9 @@ pub async fn enroll(enrollment_token: &str, hardware_serial: &str) -> Result<Dev
 async fn authenticated_get(identity: &DeviceIdentity, path: &str) -> Result<ApiEnvelope> {
     let response = client()?
         .get(format!("{}{}", super::endpoint::base_url()?, path))
+        .header("x-indagate-device-id", &identity.device_id)
         .header("x-nexus-device-id", &identity.device_id)
+        .header("x-indagate-device-secret", &identity.device_secret)
         .header("x-nexus-device-secret", &identity.device_secret)
         .send()
         .await?;
@@ -333,7 +336,9 @@ async fn authenticated_post(
 ) -> Result<ApiEnvelope> {
     let response = client()?
         .post(format!("{}{}", super::endpoint::base_url()?, path))
+        .header("x-indagate-device-id", &identity.device_id)
         .header("x-nexus-device-id", &identity.device_id)
+        .header("x-indagate-device-secret", &identity.device_secret)
         .header("x-nexus-device-secret", &identity.device_secret)
         .json(&body)
         .send()
@@ -1893,7 +1898,7 @@ pub async fn run(db_path: &str, relay_tx: mpsc::Sender<RelayCommand>) {
             nudge_tx,
         ));
     } else {
-        info!(target: "indagate_cloud", "Push stream disabled by NEXUS_CLOUD_PUSH; using timed polling only");
+        info!(target: "indagate_cloud", "Push stream disabled by INDAGATE_SERVER_PUSH; using timed polling only");
     }
 
     enum Work {
