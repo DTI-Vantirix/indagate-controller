@@ -236,6 +236,7 @@ async fn main() -> Result<()> {
     tokio::join!(
         hal::monitor::run(&profile, &db_path, relay_tx.clone(),),
         hal::wiegand::run(&profile, &db_path, relay_tx.clone(),),
+        hal::osdp::run(profile.rs485_device, &db_path, relay_tx.clone(),),
         access::unlock_schedule::run(&db_path, relay_tx.clone(),),
         cloud::agent::run(&db_path, relay_tx,),
         hal::relay_worker::run(relay_rx),

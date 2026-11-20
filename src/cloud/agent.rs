@@ -132,6 +132,87 @@ struct CloudReader {
     enabled: Option<bool>,
     protocol: String,
     configuration: Value,
+    /// Bus address of an OSDP reader (0 to 126). Absent for Wiegand.
+    #[serde(default)]
+    osdp_address: Option<i64>,
+    /// Whether an OSDP reader must use the encrypted secure channel.
+    #[serde(default)]
+    osdp_secure_channel: Option<bool>,
+}
+
+/// The D0 and D1 lines of each reader port's Wiegand input, port 1 first.
+const READER_PINS: [((&str, u64), (&str, u64)); 4] = [
+    (("gpiochip3", 23), ("gpiochip3", 25)),
+    (("gpiochip3", 26), ("gpiochip0", 15)),
+    (("gpiochip4", 10), ("gpiochip4", 26)),
+    (("gpiochip4", 27), ("gpiochip4", 11)),
+];
+
+/// Line speeds an OSDP reader may be set to.
+const OSDP_BAUD_RATES: [u32; 6] = [9600, 19200, 38400, 57600, 115200, 230400];
+const OSDP_DEFAULT_BAUD_RATE: u32 = 9600;
+
+/// What one reader port is told to be, once its settings have passed validation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReaderLink {
+    Wiegand,
+    Osdp { address: u8, baud_rate: u32 },
+}
+
+impl ReaderLink {
+    fn protocol(self) -> &'static str {
+        match self {
+            ReaderLink::Wiegand => "wiegand",
+            ReaderLink::Osdp { .. } => "osdp",
+        }
+    }
+}
+
+/// The protocol-specific part of a reader's settings. A Wiegand reader must sit on its
+/// port's own pins and be commissioned for 26-bit cards, as before. An OSDP reader needs a
+/// bus address and the RS-485 transport.
+fn reader_link(r: &CloudReader, pins: ((&str, u64), (&str, u64))) -> Result<ReaderLink> {
+    if r.protocol.eq_ignore_ascii_case("wiegand") {
+        if r.configuration.get("validated").and_then(Value::as_bool) != Some(true)
+            || r.configuration.get("format").and_then(Value::as_str) != Some("Wiegand-26")
+        {
+            return Err(anyhow!("SA16Q reader identity, commissioning or mapping invalid"));
+        }
+        for (field, (chip, line)) in [("d0", pins.0), ("d1", pins.1)] {
+            let Some(actual) = r.configuration.get(field) else {
+                return Err(anyhow!("SA16Q reader GPIO configuration missing"));
+            };
+            if actual.get("chip").and_then(Value::as_str) != Some(chip)
+                || actual.get("line").and_then(Value::as_u64) != Some(line)
+            {
+                return Err(anyhow!("SA16Q reader GPIO profile mismatch"));
+            }
+        }
+        return Ok(ReaderLink::Wiegand);
+    }
+    if r.protocol.eq_ignore_ascii_case("osdp") {
+        let Some(address) = r.osdp_address.and_then(|a| u8::try_from(a).ok()).filter(|a| *a <= 126) else {
+            return Err(anyhow!("OSDP reader needs a bus address from 0 to 126"));
+        };
+        if r.configuration.get("transport").and_then(Value::as_str) != Some("rs485") {
+            return Err(anyhow!("OSDP reader must use the RS-485 transport"));
+        }
+        let baud_rate = match r.configuration.get("baud_rate") {
+            None | Some(Value::Null) => OSDP_DEFAULT_BAUD_RATE,
+            Some(value) => value
+                .as_u64()
+                .and_then(|b| u32::try_from(b).ok())
+                .filter(|b| OSDP_BAUD_RATES.contains(b))
+                .ok_or_else(|| anyhow!("OSDP reader line speed is not one this controller supports"))?,
+        };
+        if r.osdp_secure_channel == Some(true) {
+            // Refused rather than run in the clear: there is no way yet to give the
+            // controller the reader's key.
+            return Err(anyhow!("OSDP secure channel is not supported by this firmware yet"));
+        }
+        return Ok(ReaderLink::Osdp { address, baud_rate });
+    }
+    Err(anyhow!("SA16Q reader identity, commissioning or mapping invalid"))
 }
 
 #[derive(Debug, Deserialize)]
@@ -1130,42 +1211,30 @@ fn validate_cloud_configuration(config: &CloudConfiguration) -> Result<()> {
         }
     }
 
-    // SA16Q READER POLICY V1: this version supports the pinned SP4 Wiegand
-    // port->door mapping only. It refuses uncommissioned or rewired pins;
-    // arbitrary reader reassignment is not silently treated as supported.
+    // SA16Q READER POLICY V1: each of the four reader ports keeps its pinned door. A
+    // Wiegand reader must be on its port's own pins; an OSDP reader needs its own bus
+    // address. Uncommissioned or rewired pins and arbitrary reassignment are refused.
     if config.readers.len() != 4 {
         return Err(anyhow!("SA16Q expected exactly four explicit reader policies"));
     }
     let mut seen_reader_ports = HashSet::new();
     let mut seen_reader_ids = HashSet::new();
-    let pins: [((&str,u64),(&str,u64));4] = [
-        (("gpiochip3",23),("gpiochip3",25)),
-        (("gpiochip3",26),("gpiochip0",15)),
-        (("gpiochip4",10),("gpiochip4",26)),
-        (("gpiochip4",27),("gpiochip4",11)),
-    ];
+    let mut seen_osdp_addresses = HashSet::new();
+    let pins = READER_PINS;
     for r in &config.readers {
         if !(1..=4).contains(&r.reader_number) ||
             !seen_reader_ports.insert(r.reader_number) ||
             !seen_reader_ids.insert(r.id.as_str()) ||
             uuid::Uuid::parse_str(&r.id).is_err() ||
-            !r.protocol.eq_ignore_ascii_case("wiegand") ||
             r.door_channel != Some(r.reader_number - 1) ||
             r.enabled.is_none() ||
-            r.door_id.as_deref().is_none_or(|x| uuid::Uuid::parse_str(x).is_err()) ||
-            r.configuration.get("validated").and_then(Value::as_bool) != Some(true) ||
-            r.configuration.get("format").and_then(Value::as_str) != Some("Wiegand-26")
+            r.door_id.as_deref().is_none_or(|x| uuid::Uuid::parse_str(x).is_err())
         {
             return Err(anyhow!("SA16Q reader identity, commissioning or mapping invalid"));
         }
-        let expected = pins[(r.reader_number-1) as usize];
-        for (field,(chip,line)) in [("d0",expected.0),("d1",expected.1)] {
-            let Some(actual) = r.configuration.get(field) else {
-                return Err(anyhow!("SA16Q reader GPIO configuration missing"));
-            };
-            if actual.get("chip").and_then(Value::as_str)!=Some(chip) ||
-                actual.get("line").and_then(Value::as_u64)!=Some(line) {
-                return Err(anyhow!("SA16Q reader GPIO profile mismatch"));
+        if let ReaderLink::Osdp { address, .. } = reader_link(r, pins[(r.reader_number - 1) as usize])? {
+            if !seen_osdp_addresses.insert(address) {
+                return Err(anyhow!("two OSDP readers share a bus address"));
             }
         }
     }
@@ -1361,12 +1430,21 @@ fn apply_cloud_configuration(
     // activate new or disabled reader policies.
     tx.execute("DELETE FROM reader_config", [])?;
     for reader in &config.readers {
+        // Validation has already accepted these settings; working the link out again here
+        // keeps what is stored tied to the same rules.
+        let link = reader_link(reader, READER_PINS[usize::from(reader.reader_number - 1)])?;
+        let (osdp_address, osdp_baud_rate) = match link {
+            ReaderLink::Wiegand => (None, None),
+            ReaderLink::Osdp { address, baud_rate } => (Some(i64::from(address)), Some(i64::from(baud_rate))),
+        };
         tx.execute(
-            "INSERT INTO reader_config(reader_number,reader_id,enabled,door_channel) VALUES (?1,?2,?3,?4)",
+            "INSERT INTO reader_config(reader_number,reader_id,enabled,door_channel,protocol,osdp_address,osdp_baud_rate)
+             VALUES (?1,?2,?3,?4,?5,?6,?7)",
             rusqlite::params![
                 i64::from(reader.reader_number), &reader.id,
                 if reader.enabled == Some(true) { 1i64 } else { 0i64 },
                 i64::from(reader.door_channel.ok_or_else(|| anyhow!("reader missing door channel"))?),
+                link.protocol(), osdp_address, osdp_baud_rate,
             ],
         )?;
     }
@@ -1994,6 +2072,99 @@ pub async fn run(db_path: &str, relay_tx: mpsc::Sender<RelayCommand>) {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod reader_link_tests {
+    use super::*;
+    use serde_json::json;
+
+    const PORT_ONE: ((&str, u64), (&str, u64)) = READER_PINS[0];
+
+    fn reader(extra: Value) -> CloudReader {
+        let mut base = json!({
+            "id": "11111111-1111-4111-8111-111111111111",
+            "reader_number": 1,
+            "door_channel": 0,
+            "door_id": "22222222-2222-4222-8222-222222222222",
+            "enabled": true,
+        });
+        base.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        serde_json::from_value(base).unwrap()
+    }
+
+    fn wiegand() -> Value {
+        json!({
+            "protocol": "wiegand",
+            "configuration": {
+                "validated": true, "format": "Wiegand-26",
+                "d0": { "chip": "gpiochip3", "line": 23 }, "d1": { "chip": "gpiochip3", "line": 25 }
+            }
+        })
+    }
+
+    fn osdp(address: Value, configuration: Value) -> Value {
+        json!({ "protocol": "osdp", "osdp_address": address, "osdp_secure_channel": false, "configuration": configuration })
+    }
+
+    #[test]
+    fn a_wiegand_reader_on_its_own_pins_is_accepted_as_before() {
+        assert_eq!(reader_link(&reader(wiegand()), PORT_ONE).unwrap(), ReaderLink::Wiegand);
+        // The settings the server sends for a Wiegand reader carry no OSDP fields at all.
+        let without_osdp_fields: CloudReader = serde_json::from_value(json!({
+            "id": "11111111-1111-4111-8111-111111111111", "reader_number": 1, "door_channel": 0,
+            "door_id": "22222222-2222-4222-8222-222222222222", "enabled": true,
+            "protocol": "wiegand", "configuration": wiegand()["configuration"],
+        }))
+        .unwrap();
+        assert_eq!(reader_link(&without_osdp_fields, PORT_ONE).unwrap(), ReaderLink::Wiegand);
+    }
+
+    #[test]
+    fn a_wiegand_reader_on_the_wrong_pins_or_uncommissioned_is_refused() {
+        let mut moved = wiegand();
+        moved["configuration"]["d0"]["line"] = json!(24);
+        assert!(reader_link(&reader(moved), PORT_ONE).is_err());
+        let mut uncommissioned = wiegand();
+        uncommissioned["configuration"]["validated"] = json!(false);
+        assert!(reader_link(&reader(uncommissioned), PORT_ONE).is_err());
+        let mut other_format = wiegand();
+        other_format["configuration"]["format"] = json!("Wiegand-34");
+        assert!(reader_link(&reader(other_format), PORT_ONE).is_err());
+    }
+
+    #[test]
+    fn an_osdp_reader_needs_an_address_and_the_rs485_transport() {
+        let rs485 = json!({ "transport": "rs485" });
+        assert_eq!(
+            reader_link(&reader(osdp(json!(7), rs485.clone())), PORT_ONE).unwrap(),
+            ReaderLink::Osdp { address: 7, baud_rate: 9600 }
+        );
+        assert_eq!(
+            reader_link(&reader(osdp(json!(126), json!({ "transport": "rs485", "baud_rate": 115200 }))), PORT_ONE).unwrap(),
+            ReaderLink::Osdp { address: 126, baud_rate: 115200 }
+        );
+        for bad_address in [json!(null), json!(127), json!(-1), json!(300)] {
+            assert!(reader_link(&reader(osdp(bad_address.clone(), rs485.clone())), PORT_ONE).is_err(), "{bad_address}");
+        }
+        assert!(reader_link(&reader(osdp(json!(7), json!({}))), PORT_ONE).is_err());
+        assert!(reader_link(&reader(osdp(json!(7), json!({ "transport": "rs485", "baud_rate": 1200 }))), PORT_ONE).is_err());
+        assert!(reader_link(&reader(osdp(json!(7), json!({ "transport": "rs485", "baud_rate": "fast" }))), PORT_ONE).is_err());
+    }
+
+    #[test]
+    fn secure_channel_is_refused_rather_than_run_in_the_clear() {
+        let mut secure = osdp(json!(7), json!({ "transport": "rs485" }));
+        secure["osdp_secure_channel"] = json!(true);
+        let error = reader_link(&reader(secure), PORT_ONE).unwrap_err().to_string();
+        assert!(error.contains("secure channel"), "{error}");
+    }
+
+    #[test]
+    fn an_unknown_protocol_is_refused() {
+        let unknown = json!({ "protocol": "clock-and-data", "configuration": {} });
+        assert!(reader_link(&reader(unknown), PORT_ONE).is_err());
     }
 }
 
