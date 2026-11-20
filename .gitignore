@@ -24,3 +24,8 @@ Thumbs.db
 
 # Source files with 'secret' in the name are code, not secrets
 !src/**/*secret*.rs
+
+# Migration-era backups
+.hlaxs-*
+*.before-*
+*.backup-*
