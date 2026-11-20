@@ -1,5 +1,6 @@
-use chrono::Utc;
-use rusqlite::params;
+//! Wiegand readers: collects card bits from the D0/D1 GPIO lines and hands each frame to
+//! the shared card-read path (`super::card_read`), which decides and actuates.
+
 use serde_json::json;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom};
@@ -7,20 +8,12 @@ use std::os::fd::AsRawFd;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
-use uuid::Uuid;
 
-use crate::access::engine::{self, AccessDecision};
 use crate::storage::ControllerDatabase;
 
+use super::card_read::{self, CardRead, ReadSource, queue_event};
 use super::profile::{BoardProfile, GpioLine};
 use super::relay_worker::RelayCommand;
-
-#[derive(Debug)]
-struct ReaderState {
-    channel: u8,
-    bits: Vec<u8>,
-    last_bit_at: Option<Instant>,
-}
 
 fn chip_index(chip: &str) -> Option<u32> {
     chip.strip_prefix("gpiochip")?.parse::<u32>().ok()
@@ -28,278 +21,6 @@ fn chip_index(chip: &str) -> Option<u32> {
 
 fn legacy_gpio(line: &GpioLine) -> Option<u32> {
     chip_index(line.chip).map(|index| (index * 32) + line.line)
-}
-
-fn validate_26(bits: &[u8]) -> bool {
-    if bits.len() != 26 {
-        return false;
-    }
-
-    let first_12_ones = bits[1..13].iter().filter(|&&b| b == 1).count();
-
-    let second_12_ones = bits[13..25].iter().filter(|&&b| b == 1).count();
-
-    let leading_parity = bits[0] as usize;
-    let trailing_parity = bits[25] as usize;
-
-    let first_even = (first_12_ones + leading_parity) % 2 == 0;
-
-    let second_odd = (second_12_ones + trailing_parity) % 2 == 1;
-
-    first_even && second_odd
-}
-
-fn decode_26(bits: &[u8]) -> Option<(u8, u16, u32, bool)> {
-    if bits.len() != 26 {
-        return None;
-    }
-
-    let mut facility: u8 = 0;
-
-    for &bit in &bits[1..9] {
-        facility = (facility << 1) | bit;
-    }
-
-    let mut card: u16 = 0;
-
-    for &bit in &bits[9..25] {
-        card = (card << 1) | bit as u16;
-    }
-
-    let mut full: u32 = 0;
-
-    for &bit in bits {
-        full = (full << 1) | bit as u32;
-    }
-
-    Some((facility, card, full, validate_26(bits)))
-}
-
-fn bit_string(bits: &[u8]) -> String {
-    bits.iter()
-        .map(|b| if *b == 0 { '0' } else { '1' })
-        .collect()
-}
-
-fn queue_event(db: &ControllerDatabase, event_type: &str, channel: u8, payload: serde_json::Value) {
-    let result = db.connection().execute(
-        r#"
-        INSERT INTO event_queue
-        (
-            id,
-            event_type,
-            channel,
-            payload_json,
-            occurred_at
-        )
-        VALUES (?1, ?2, ?3, ?4, ?5)
-        "#,
-        params![
-            Uuid::new_v4().to_string(),
-            event_type,
-            channel,
-            payload.to_string(),
-            Utc::now().to_rfc3339(),
-        ],
-    );
-
-    if let Err(e) = result {
-        warn!(
-            event_type = event_type,
-            channel = channel,
-            error = %e,
-            "Unable to queue Indagate event"
-        );
-    }
-}
-
-async fn finish_frame(
-    reader: &mut ReaderState,
-    db: &ControllerDatabase,
-    relay_tx: &mpsc::Sender<RelayCommand>,
-) {
-    if reader.bits.is_empty() {
-        return;
-    }
-
-    let bits = std::mem::take(&mut reader.bits);
-    let raw_bits = bit_string(&bits);
-
-    let Some((facility, card, full, parity_valid)) = decode_26(&bits) else {
-        warn!(
-            target: "indagate_wiegand",
-            reader = reader.channel + 1,
-            channel = reader.channel,
-            bits = bits.len(),
-            raw_bits = %raw_bits,
-            "Invalid Wiegand frame length"
-        );
-
-        queue_event(
-            db,
-            "wiegand_invalid_frame",
-            reader.channel,
-            json!({
-                "reader": reader.channel + 1,
-                "bits": bits.len(),
-                "raw_bits": raw_bits,
-                "reason": "invalid_frame_length"
-            }),
-        );
-
-        reader.last_bit_at = None;
-        return;
-    };
-
-    if !parity_valid {
-        warn!(
-            target: "indagate_wiegand",
-            reader = reader.channel + 1,
-            channel = reader.channel,
-            facility_code = facility,
-            card_code = card,
-            raw_bits = %raw_bits,
-            "Credential rejected: invalid Wiegand parity"
-        );
-
-        queue_event(
-            db,
-            "access_deny",
-            reader.channel,
-            json!({
-                "reader": reader.channel + 1,
-                "facility_code": facility,
-                "card_code": card,
-                "full_code": full,
-                "raw_bits": raw_bits,
-                "parity_valid": false,
-                "decision": "Deny",
-                "reason": "invalid_parity"
-            }),
-        );
-
-        reader.last_bit_at = None;
-        return;
-    }
-
-    match engine::evaluate(db.connection(), facility, card, reader.channel) {
-        Ok(result) => {
-            let event_type = match result.decision {
-                AccessDecision::Grant => "access_grant",
-                AccessDecision::Deny => "access_deny",
-            };
-
-            let mut relay_command_queued = false;
-            let mut unlock_ms: Option<u64> = None;
-
-            if matches!(result.decision, AccessDecision::Grant) {
-                match db.door_unlock_ms(reader.channel) {
-                    Ok(Some(duration)) => {
-                        unlock_ms = Some(duration);
-
-                        match relay_tx
-                            .send(RelayCommand::Pulse {
-                                channel: reader.channel,
-                                duration_ms: duration,
-                                response: None,
-                            })
-                            .await
-                        {
-                            Ok(()) => {
-                                relay_command_queued = true;
-                            }
-
-                            Err(e) => {
-                                error!(
-                                    target: "indagate_access",
-                                    channel = reader.channel,
-                                    error = %e,
-                                    "Access GRANT could not be sent to relay worker"
-                                );
-                            }
-                        }
-                    }
-
-                    Ok(None) => {
-                        error!(
-                            target: "indagate_access",
-                            channel = reader.channel,
-                            "Access GRANT has no enabled door configuration"
-                        );
-                    }
-
-                    Err(e) => {
-                        error!(
-                            target: "indagate_access",
-                            channel = reader.channel,
-                            error = %e,
-                            "Unable to load door unlock duration"
-                        );
-                    }
-                }
-            }
-
-            info!(
-                target: "indagate_access",
-                reader = reader.channel + 1,
-                channel = reader.channel,
-                facility_code = facility,
-                card_code = card,
-                decision = ?result.decision,
-                reason = %result.reason,
-                holder = ?result.holder_name,
-                unlock_ms = ?unlock_ms,
-                relay_command_queued = relay_command_queued,
-                "ACCESS DECISION"
-            );
-
-            queue_event(
-                db,
-                event_type,
-                reader.channel,
-                json!({
-                    "reader": reader.channel + 1,
-                    "facility_code": facility,
-                    "card_code": card,
-                    "full_code": full,
-                    "raw_bits": raw_bits,
-                    "parity_valid": true,
-                    "decision": result.decision,
-                    "reason": result.reason,
-                    "credential_id": result.credential_id,
-                    "holder_name": result.holder_name,
-                    "unlock_ms": unlock_ms,
-                    "relay_command_queued": relay_command_queued
-                }),
-            );
-        }
-
-        Err(e) => {
-            warn!(
-                target: "indagate_access",
-                reader = reader.channel + 1,
-                channel = reader.channel,
-                facility_code = facility,
-                card_code = card,
-                error = %e,
-                "Access engine failure"
-            );
-
-            queue_event(
-                db,
-                "access_error",
-                reader.channel,
-                json!({
-                    "reader": reader.channel + 1,
-                    "facility_code": facility,
-                    "card_code": card,
-                    "reason": "access_engine_error"
-                }),
-            );
-        }
-    }
-
-    reader.last_bit_at = None;
 }
 
 // SA-16I: production Wiegand collection uses kernel GPIO falling-edge events.
@@ -484,11 +205,7 @@ pub async fn run(profile: &BoardProfile, db_path: &str, relay_tx: mpsc::Sender<R
             return;
         }
     };
-    let mut readers: Vec<ReaderState> = profile.readers.iter().map(|r| ReaderState {
-        channel: r.channel,
-        bits: Vec::with_capacity(EDGE_MAX_BITS),
-        last_bit_at: None,
-    }).collect();
+    let readers: Vec<u8> = profile.readers.iter().map(|r| r.channel).collect();
 
     let (frame_tx, mut frame_rx) = mpsc::channel::<EdgeFrame>(64);
     let edge_profile = profile.clone();
@@ -524,10 +241,16 @@ pub async fn run(profile: &BoardProfile, db_path: &str, relay_tx: mpsc::Sender<R
                                 json!({"reason":"capture_overflow", "bits":frame.bits.len()}));
                     continue;
                 }
-                if let Some(reader) = readers.iter_mut().find(|r| r.channel == frame.channel) {
-                    reader.bits = frame.bits;
-                    reader.last_bit_at = None;
-                    finish_frame(reader, &db, &relay_tx).await;
+                if readers.contains(&frame.channel) {
+                    if frame.bits.is_empty() {
+                        continue;
+                    }
+                    let read = CardRead {
+                        channel: frame.channel,
+                        bits: frame.bits,
+                        source: ReadSource::Wiegand,
+                    };
+                    card_read::handle(read, &db, &relay_tx).await;
                 } else {
                     error!(target: "indagate_wiegand", channel=frame.channel, "Unknown reader channel");
                 }
