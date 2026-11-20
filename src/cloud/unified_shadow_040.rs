@@ -1,4 +1,4 @@
-//! HLAXS.Access 0.4 Stage A: cloud-signed bench shadow authorization INSIDE
+//! Indagate Access 0.4 Stage A: cloud-signed bench shadow authorization INSIDE
 //! the existing strict-diagnostic Rust controller process.
 //!
 //! No actuator, GPIO, local access engine, cloud command, or event-write APIs.
@@ -371,7 +371,7 @@ fn run(rx:mpsc::Receiver<CaptureFrame>)->Result<()> {
     let preview_enabled=preview_requested && match preview_3e::stage_db_private() {
         Ok(())=>true,
         Err(e)=>{
-            warn!(target:"hlaxs040_stage3e",reason=%e,
+            warn!(target: "indagate_stage3e",reason=%e,
                 "private Stage3C database missing; preview disabled, v6 shadow unaffected");
             false
         }
@@ -380,7 +380,7 @@ fn run(rx:mpsc::Receiver<CaptureFrame>)->Result<()> {
     // It can ONLY run inside the strict non-actuating diagnostic process.
     let offline_only=std::env::var("HLAXS040_OFFLINE_CACHE_ONLY").as_deref()==Ok("1");
     let mut next_refresh=Instant::now();
-    info!(target:"hlaxs040_unified_shadow", "Rust bench shadow worker started (nonactuating)");
+    info!(target: "indagate_unified_shadow", "Rust bench shadow worker started (nonactuating)");
     loop {
         if Instant::now()>=next_refresh {
             // Never service reader events while fetching or validating policy.
@@ -411,10 +411,10 @@ fn run(rx:mpsc::Receiver<CaptureFrame>)->Result<()> {
                     })();
                     match status {
                         Ok(()) => {
-                            info!(target:"hlaxs040_unified_shadow",config_version=p.version,credentials_loaded_in_memory=p.document["credentials"].as_array().map_or(0,Vec::len),"signed bench policy accepted and cached");
+                            info!(target: "indagate_unified_shadow",config_version=p.version,credentials_loaded_in_memory=p.document["credentials"].as_array().map_or(0,Vec::len),"signed bench policy accepted and cached");
                             policy=Some((p,"cloud_live"));
                         }
-                        Err(e) => warn!(target:"hlaxs040_unified_shadow", reason=%e,
+                        Err(e) => warn!(target: "indagate_unified_shadow", reason=%e,
                             "Policy persistence/rollback validation failed; shadow disabled"),
                     }
                 }
@@ -427,11 +427,11 @@ fn run(rx:mpsc::Receiver<CaptureFrame>)->Result<()> {
                     })();
                     match recovered {
                         Ok(p)=>{
-                            info!(target:"hlaxs040_unified_shadow",config_version=p.version,
+                            info!(target: "indagate_unified_shadow",config_version=p.version,
                                 "signed bench policy recovered from offline cache; untrusted time; deny-only shadow");
                             policy=Some((p,"offline_signed_cache"));
                         }
-                        Err(_)=>warn!(target:"hlaxs040_unified_shadow",
+                        Err(_)=>warn!(target: "indagate_unified_shadow",
                             "Cloud policy unavailable; signed cache missing, expired or untrusted; shadow disabled"),
                     }
                 }
@@ -443,11 +443,11 @@ fn run(rx:mpsc::Receiver<CaptureFrame>)->Result<()> {
             if preview_enabled && !offline_only {
                 match rt.block_on(preview_3e::fetch_preview(&client,&identity,&key)) {
                     Ok(p) => {
-                        info!(target:"hlaxs040_stage3e",config_version=p.version,
+                        info!(target: "indagate_stage3e",config_version=p.version,
                             "signed v7 BENCH preview available IN MEMORY; nonactuating");
                         preview=Some(p);
                     }
-                    Err(e) => warn!(target:"hlaxs040_stage3e",reason=%e,
+                    Err(e) => warn!(target: "indagate_stage3e",reason=%e,
                         "signed v7 preview unavailable; preview evaluations disabled"),
                 }
             }
@@ -460,7 +460,7 @@ fn run(rx:mpsc::Receiver<CaptureFrame>)->Result<()> {
                 if let Some((p,source))=&policy {
                     if Utc::now()<p.expires {
                         let result=shadow_result(p,&frame,source);
-                        info!(target:"hlaxs040_unified_shadow",result=%result,"NONACTUATING: in-process signed-policy shadow result");
+                        info!(target: "indagate_unified_shadow",result=%result,"NONACTUATING: in-process signed-policy shadow result");
                     }
                 }
                 // Evaluate the exact same completed physical capture frame in
@@ -469,7 +469,7 @@ fn run(rx:mpsc::Receiver<CaptureFrame>)->Result<()> {
                 if let Some(p)=&preview {
                     if Utc::now()<p.expires {
                         let report=preview_3e::physical_result(p,&frame);
-                        info!(target:"hlaxs040_stage3e",result=%report,
+                        info!(target: "indagate_stage3e",result=%report,
                             "NONACTUATING: Stage3E physical-frame signed v7 preview");
                     } else {preview=None;}
                 }
@@ -487,7 +487,7 @@ pub fn start()->Option<SyncSender<CaptureFrame>> {
        unsafe{libc::geteuid()}!=0 {return None}
     let (tx,rx)=mpsc::sync_channel::<CaptureFrame>(128);
     std::thread::spawn(move|| {
-        if run(rx).is_err(){warn!(target:"hlaxs040_unified_shadow","Rust shadow worker unavailable; fail closed");}
+        if run(rx).is_err(){warn!(target: "indagate_unified_shadow","Rust shadow worker unavailable; fail closed");}
     });
     Some(tx)
 }

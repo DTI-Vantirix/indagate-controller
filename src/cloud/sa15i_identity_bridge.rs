@@ -1,4 +1,4 @@
-//! SA-15I: read-only lifecycle integration contract for HLAXS device identity.
+//! SA-15I: read-only lifecycle integration contract for device identity.
 //!
 //! The live cloud agent still reads /var/lib/highline-nexus/device.json,
 //! performs existing shared-secret authentication and rotates credentials

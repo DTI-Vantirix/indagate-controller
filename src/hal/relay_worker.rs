@@ -120,7 +120,7 @@ fn load_overrides() -> PersistedOverrideFile {
 
         Err(e) => {
             error!(
-                target: "nexus_relay",
+                target: "indagate_relay",
                 error = %e,
                 "Unable to load door overrides; using normal schedule"
             );
@@ -224,7 +224,7 @@ pub async fn run(mut receiver: mpsc::Receiver<RelayCommand>) {
 
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
-    info!("Nexus relay command worker started");
+    info!("Indagate relay command worker started");
 
     //
     // Do NOT actuate persistent state here.
@@ -270,7 +270,7 @@ pub async fn run(mut receiver: mpsc::Receiver<RelayCommand>) {
                     } => {
                         if active && !fire_active {
                             info!(
-                                target: "nexus_fire",
+                                target: "indagate_fire",
                                 "FIRE OVERRIDE ACTIVE"
                             );
 
@@ -310,7 +310,7 @@ pub async fn run(mut receiver: mpsc::Receiver<RelayCommand>) {
                                 ) {
                                     Ok(state) => {
                                         info!(
-                                            target: "nexus_fire",
+                                            target: "indagate_fire",
                                             channel = channel,
                                             previous_normal_state =
                                                 normal,
@@ -324,7 +324,7 @@ pub async fn run(mut receiver: mpsc::Receiver<RelayCommand>) {
 
                                     Err(e) => {
                                         error!(
-                                            target: "nexus_fire",
+                                            target: "indagate_fire",
                                             channel = channel,
                                             error = %e,
                                             "Unable to apply fire relay state"
@@ -336,7 +336,7 @@ pub async fn run(mut receiver: mpsc::Receiver<RelayCommand>) {
 
                         if !active && fire_active {
                             info!(
-                                target: "nexus_fire",
+                                target: "indagate_fire",
                                 "FIRE OVERRIDE CLEARED"
                             );
 
@@ -362,7 +362,7 @@ pub async fn run(mut receiver: mpsc::Receiver<RelayCommand>) {
                                 ) {
                                     Ok(state) => {
                                         info!(
-                                            target: "nexus_fire",
+                                            target: "indagate_fire",
                                             channel = channel,
                                             restored_state =
                                                 desired,
@@ -374,7 +374,7 @@ pub async fn run(mut receiver: mpsc::Receiver<RelayCommand>) {
 
                                     Err(e) => {
                                         error!(
-                                            target: "nexus_fire",
+                                            target: "indagate_fire",
                                             channel = channel,
                                             error = %e,
                                             "Unable to restore relay after fire"
@@ -412,7 +412,7 @@ pub async fn run(mut receiver: mpsc::Receiver<RelayCommand>) {
                         //
                         if fire_active {
                             warn!(
-                                target: "nexus_relay",
+                                target: "indagate_relay",
                                 channel = channel,
                                 "Relay pulse ignored during fire override"
                             );
@@ -442,7 +442,7 @@ pub async fn run(mut receiver: mpsc::Receiver<RelayCommand>) {
                             )
                         ) {
                             warn!(
-                                target: "nexus_relay",
+                                target: "indagate_relay",
                                 channel = channel,
                                 "Relay pulse suppressed by force-lock override"
                             );
@@ -471,7 +471,7 @@ pub async fn run(mut receiver: mpsc::Receiver<RelayCommand>) {
                             )
                         ) {
                             info!(
-                                target: "nexus_relay",
+                                target: "indagate_relay",
                                 channel = channel,
                                 "Relay pulse unnecessary during hold-unlocked override"
                             );
@@ -498,7 +498,7 @@ pub async fn run(mut receiver: mpsc::Receiver<RelayCommand>) {
                                 );
 
                                 info!(
-                                    target: "nexus_relay",
+                                    target: "indagate_relay",
                                     event =
                                         "relay_on",
                                     channel =
@@ -517,7 +517,7 @@ pub async fn run(mut receiver: mpsc::Receiver<RelayCommand>) {
 
                             Err(e) => {
                                 error!(
-                                    target: "nexus_relay",
+                                    target: "indagate_relay",
                                     channel =
                                         channel,
                                     error = %e,
@@ -573,7 +573,7 @@ pub async fn run(mut receiver: mpsc::Receiver<RelayCommand>) {
                         ) {
                             Ok(state) => {
                                 info!(
-                                    target: "nexus_relay",
+                                    target: "indagate_relay",
                                     event =
                                         "relay_schedule_reconciled",
                                     channel =
@@ -596,7 +596,7 @@ pub async fn run(mut receiver: mpsc::Receiver<RelayCommand>) {
 
                             Err(e) => {
                                 error!(
-                                    target: "nexus_relay",
+                                    target: "indagate_relay",
                                     channel =
                                         channel,
                                     error = %e,
@@ -642,7 +642,7 @@ pub async fn run(mut receiver: mpsc::Receiver<RelayCommand>) {
                         ) {
                             Ok(state) => {
                                 info!(
-                                    target: "nexus_relay",
+                                    target: "indagate_relay",
                                     event =
                                         "relay_schedule_reconciled",
                                     channel =
@@ -665,7 +665,7 @@ pub async fn run(mut receiver: mpsc::Receiver<RelayCommand>) {
 
                             Err(e) => {
                                 error!(
-                                    target: "nexus_relay",
+                                    target: "indagate_relay",
                                     channel =
                                         channel,
                                     error = %e,
@@ -790,7 +790,7 @@ pub async fn run(mut receiver: mpsc::Receiver<RelayCommand>) {
                             }
 
                             info!(
-                                target: "nexus_relay",
+                                target: "indagate_relay",
                                 event =
                                     "door_override_set",
                                 channel =
@@ -899,7 +899,7 @@ pub async fn run(mut receiver: mpsc::Receiver<RelayCommand>) {
                             }
 
                             info!(
-                                target: "nexus_relay",
+                                target: "indagate_relay",
                                 event =
                                     "door_override_cleared",
                                 channel =
@@ -968,7 +968,7 @@ pub async fn run(mut receiver: mpsc::Receiver<RelayCommand>) {
                     ) {
                         Ok(state) => {
                             info!(
-                                target: "nexus_relay",
+                                target: "indagate_relay",
                                 event =
                                     "door_override_expired",
                                 channel =
@@ -985,7 +985,7 @@ pub async fn run(mut receiver: mpsc::Receiver<RelayCommand>) {
 
                         Err(e) => {
                             error!(
-                                target: "nexus_relay",
+                                target: "indagate_relay",
                                 channel =
                                     channel,
                                 error = %e,
@@ -1002,7 +1002,7 @@ pub async fn run(mut receiver: mpsc::Receiver<RelayCommand>) {
                         )
                     {
                         error!(
-                            target: "nexus_relay",
+                            target: "indagate_relay",
                             error = %e,
                             "Unable to persist expired override cleanup"
                         );
@@ -1051,7 +1051,7 @@ pub async fn run(mut receiver: mpsc::Receiver<RelayCommand>) {
                             ] = None;
 
                             info!(
-                                target: "nexus_relay",
+                                target: "indagate_relay",
                                 event =
                                     "relay_pulse_complete",
                                 channel =
@@ -1066,7 +1066,7 @@ pub async fn run(mut receiver: mpsc::Receiver<RelayCommand>) {
 
                         Err(e) => {
                             error!(
-                                target: "nexus_relay",
+                                target: "indagate_relay",
                                 channel =
                                     channel,
                                 error = %e,

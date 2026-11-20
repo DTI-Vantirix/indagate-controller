@@ -5,11 +5,11 @@ use std::path::Path;
 
 pub const DEFAULT_DB_PATH: &str = "/var/lib/highline-nexus/nexus.db";
 
-pub struct NexusDatabase {
+pub struct ControllerDatabase {
     conn: Connection,
 }
 
-impl NexusDatabase {
+impl ControllerDatabase {
     pub fn open(path: &str) -> Result<Self> {
         if let Some(parent) = Path::new(path).parent() {
             fs::create_dir_all(parent)

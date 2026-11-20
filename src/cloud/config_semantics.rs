@@ -1,4 +1,4 @@
-//! HLAXS.Access semantic configuration validator + deterministic, read-only plan.
+//! Indagate Access semantic configuration validator + deterministic, read-only plan.
 //!
 //! NEVER invoked from the running agent. No GPIO, device commands, production DB,
 //! network I/O, cloud ACK, or physical actuation API is present in this module.

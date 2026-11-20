@@ -1,4 +1,4 @@
-//! HLAXS.Access 0.4 Stage 3D — isolated BENCH signed-v7 subject preview.
+//! Indagate Access 0.4 Stage 3D — isolated BENCH signed-v7 subject preview.
 //! Read-only device utility: never applies controller config, sends an ACK,
 //! writes shadow policy/cache/state or drives any physical output.
 #![allow(dead_code)]

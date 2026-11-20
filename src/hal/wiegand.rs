@@ -10,7 +10,7 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::access::engine::{self, AccessDecision};
-use crate::storage::NexusDatabase;
+use crate::storage::ControllerDatabase;
 
 use super::profile::{BoardProfile, GpioLine};
 use super::relay_worker::RelayCommand;
@@ -81,7 +81,7 @@ fn bit_string(bits: &[u8]) -> String {
         .collect()
 }
 
-fn queue_event(db: &NexusDatabase, event_type: &str, channel: u8, payload: serde_json::Value) {
+fn queue_event(db: &ControllerDatabase, event_type: &str, channel: u8, payload: serde_json::Value) {
     let result = db.connection().execute(
         r#"
         INSERT INTO event_queue
@@ -108,14 +108,14 @@ fn queue_event(db: &NexusDatabase, event_type: &str, channel: u8, payload: serde
             event_type = event_type,
             channel = channel,
             error = %e,
-            "Unable to queue Nexus event"
+            "Unable to queue Indagate event"
         );
     }
 }
 
 async fn finish_frame(
     reader: &mut ReaderState,
-    db: &NexusDatabase,
+    db: &ControllerDatabase,
     relay_tx: &mpsc::Sender<RelayCommand>,
 ) {
     if reader.bits.is_empty() {
@@ -127,7 +127,7 @@ async fn finish_frame(
 
     let Some((facility, card, full, parity_valid)) = decode_26(&bits) else {
         warn!(
-            target: "nexus_wiegand",
+            target: "indagate_wiegand",
             reader = reader.channel + 1,
             channel = reader.channel,
             bits = bits.len(),
@@ -153,7 +153,7 @@ async fn finish_frame(
 
     if !parity_valid {
         warn!(
-            target: "nexus_wiegand",
+            target: "indagate_wiegand",
             reader = reader.channel + 1,
             channel = reader.channel,
             facility_code = facility,
@@ -211,7 +211,7 @@ async fn finish_frame(
 
                             Err(e) => {
                                 error!(
-                                    target: "nexus_access",
+                                    target: "indagate_access",
                                     channel = reader.channel,
                                     error = %e,
                                     "Access GRANT could not be sent to relay worker"
@@ -222,7 +222,7 @@ async fn finish_frame(
 
                     Ok(None) => {
                         error!(
-                            target: "nexus_access",
+                            target: "indagate_access",
                             channel = reader.channel,
                             "Access GRANT has no enabled door configuration"
                         );
@@ -230,7 +230,7 @@ async fn finish_frame(
 
                     Err(e) => {
                         error!(
-                            target: "nexus_access",
+                            target: "indagate_access",
                             channel = reader.channel,
                             error = %e,
                             "Unable to load door unlock duration"
@@ -240,7 +240,7 @@ async fn finish_frame(
             }
 
             info!(
-                target: "nexus_access",
+                target: "indagate_access",
                 reader = reader.channel + 1,
                 channel = reader.channel,
                 facility_code = facility,
@@ -276,7 +276,7 @@ async fn finish_frame(
 
         Err(e) => {
             warn!(
-                target: "nexus_access",
+                target: "indagate_access",
                 reader = reader.channel + 1,
                 channel = reader.channel,
                 facility_code = facility,
@@ -394,7 +394,7 @@ fn open_edge_line(gpio: u32, reader_index: usize, bit: u8) -> Result<EdgeLine, S
         if observed.trim() != "falling" {
             return Err(format!("GPIO {gpio}: cannot enable falling edge (got {})", observed.trim()));
         }
-        info!(target: "nexus_wiegand", gpio, "Enabled GPIO falling-edge notifications");
+        info!(target: "indagate_wiegand", gpio, "Enabled GPIO falling-edge notifications");
     }
     let mut file = OpenOptions::new().read(true).open(format!("{base}/value"))
         .map_err(|e| format!("GPIO {gpio} open event input: {e}"))?;
@@ -420,7 +420,7 @@ fn collect_edge_frames(
     }
     let mut buffers: Vec<EdgeBuffer> = profile.readers.iter()
         .map(|_| EdgeBuffer::default()).collect();
-    info!(target: "nexus_wiegand", inputs = lines.len(),
+    info!(target: "indagate_wiegand", inputs = lines.len(),
           "PRODUCTION WIEGAND FALLING-EDGE CAPTURE STARTED");
 
     loop {
@@ -457,7 +457,7 @@ fn collect_edge_frames(
             if let Some(frame) = buffer.finish_if_quiet(channel, now) {
                 // Never stall the timing-critical GPIO collector for SQLite or a relay command.
                 if let Err(err) = frames_tx.try_send(frame) {
-                    warn!(target: "nexus_wiegand", channel,
+                    warn!(target: "indagate_wiegand", channel,
                           error = %err, "WIEGAND FRAME DROPPED: event-consumer unavailable or busy");
                 }
             }
@@ -477,10 +477,10 @@ pub async fn run(profile: &BoardProfile, db_path: &str, relay_tx: mpsc::Sender<R
         return;
     }
 
-    let db = match NexusDatabase::open(db_path) {
+    let db = match ControllerDatabase::open(db_path) {
         Ok(db) => db,
         Err(err) => {
-            error!(error=%err, "Unable to open Nexus database for production Wiegand engine");
+            error!(error=%err, "Unable to open Indagate database for production Wiegand engine");
             return;
         }
     };
@@ -493,32 +493,32 @@ pub async fn run(profile: &BoardProfile, db_path: &str, relay_tx: mpsc::Sender<R
     let (frame_tx, mut frame_rx) = mpsc::channel::<EdgeFrame>(64);
     let edge_profile = profile.clone();
     let mut worker = tokio::task::spawn_blocking(move || collect_edge_frames(edge_profile, frame_tx));
-    info!(target: "nexus_wiegand", readers = readers.len(),
+    info!(target: "indagate_wiegand", readers = readers.len(),
           "Wiegand production access engine awaiting captured GPIO frames");
 
     loop {
         tokio::select! {
             worker_result = &mut worker => {
                 match worker_result {
-                    Ok(Ok(())) => error!(target: "nexus_wiegand", "Wiegand edge collector unexpectedly exited"),
-                    Ok(Err(err)) => error!(target: "nexus_wiegand", error=%err,
+                    Ok(Ok(())) => error!(target: "indagate_wiegand", "Wiegand edge collector unexpectedly exited"),
+                    Ok(Err(err)) => error!(target: "indagate_wiegand", error=%err,
                                           "Wiegand edge collector stopped; ACCESS READER INPUTS OFFLINE"),
-                    Err(err) => error!(target: "nexus_wiegand", error=%err,
+                    Err(err) => error!(target: "indagate_wiegand", error=%err,
                                        "Wiegand edge collector panicked; ACCESS READER INPUTS OFFLINE"),
                 }
                 break;
             }
             frame = frame_rx.recv() => {
                 let Some(frame) = frame else {
-                    error!(target: "nexus_wiegand", "Wiegand frame channel closed");
+                    error!(target: "indagate_wiegand", "Wiegand frame channel closed");
                     break;
                 };
-                info!(target: "nexus_wiegand", reader=frame.channel+1, channel=frame.channel,
+                info!(target: "indagate_wiegand", reader=frame.channel+1, channel=frame.channel,
                       bits=frame.bits.len(), min_observed_gap_us=?frame.min_gap_us,
                       max_observed_gap_us=?frame.max_gap_us, overflow=frame.overflow,
                       "WIEGAND EDGE FRAME RECEIVED");
                 if frame.overflow {
-                    warn!(target: "nexus_wiegand", channel=frame.channel,
+                    warn!(target: "indagate_wiegand", channel=frame.channel,
                           "Wiegand frame overflow: rejecting instead of attempting authorization");
                     queue_event(&db, "wiegand_invalid_frame", frame.channel,
                                 json!({"reason":"capture_overflow", "bits":frame.bits.len()}));
@@ -529,7 +529,7 @@ pub async fn run(profile: &BoardProfile, db_path: &str, relay_tx: mpsc::Sender<R
                     reader.last_bit_at = None;
                     finish_frame(reader, &db, &relay_tx).await;
                 } else {
-                    error!(target: "nexus_wiegand", channel=frame.channel, "Unknown reader channel");
+                    error!(target: "indagate_wiegand", channel=frame.channel, "Unknown reader channel");
                 }
             }
         }
