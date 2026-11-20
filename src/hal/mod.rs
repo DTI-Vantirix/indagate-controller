@@ -1,3 +1,4 @@
+pub mod card_read;
 pub mod credential_capture;
 pub mod credential_formats;
 pub mod health;
