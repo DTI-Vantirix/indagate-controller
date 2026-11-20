@@ -4,6 +4,7 @@ pub mod credential_formats;
 pub mod health;
 pub mod input;
 pub mod monitor;
+pub mod osdp;
 pub mod profile;
 pub mod relay;
 pub mod relay_worker;
