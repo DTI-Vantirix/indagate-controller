@@ -21,3 +21,6 @@
 .idea/
 .DS_Store
 Thumbs.db
+
+# Source files with 'secret' in the name are code, not secrets
+!src/**/*secret*.rs
