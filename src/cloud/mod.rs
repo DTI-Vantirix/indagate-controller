@@ -1,4 +1,7 @@
 pub mod agent;
+
+// Cloud address, trusted certificate authorities, shared HTTP client and push stream.
+pub mod endpoint;
 pub mod config_shadow;
 pub mod unified_shadow_040;
 
