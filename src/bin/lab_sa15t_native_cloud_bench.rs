@@ -1,4 +1,4 @@
-//! SA-15T: Native CAAM-backed real Supabase authentication with a disposable SA-15S identity.
+//! SA-15T: Native CAAM-backed real server authentication with a disposable SA-15S identity.
 //! STRICT TEST ONLY. Cannot read /var/lib/highline-nexus; no relay or live service interaction.
 //! Deliberately does NOT rotate credentials, claim commands, or modify controller cloud state.
 #[path = "../cloud/secret_envelope.rs"]
@@ -33,7 +33,11 @@ const BLOB_NAME: &str = "wrapped-key.bb";
 const CONTROLLER: &str = "93be1d68-170a-4564-a9b7-6c71817a0e2d";
 const DEVICE: &str = "e259087a-0647-41f4-82d7-6841513bc41c";
 const WRAP_ID: &str = "hlaxs-sa15e-sa15t-cloud-bench";
-const ENDPOINT: &str = "https://gxwfuurzkdhxwxdbtdmt.supabase.co/functions/v1/nexus-device/v1/credential/rotate/commit";
+/// The server to call, from `INDAGATE_SERVER_URL`. There is no built-in address.
+fn endpoint() -> String {
+    let base = std::env::var("INDAGATE_SERVER_URL").expect("set INDAGATE_SERVER_URL to the server address");
+    format!("{}/v1/credential/rotate/commit", base.trim_end_matches('/'))
+}
 const WRONG_CERTIFICATE: &str = "00000000-0000-4000-8000-000000000000";
 
 #[derive(Deserialize, Serialize)]
@@ -157,7 +161,7 @@ async fn check_cloud() -> Result<()> {
     // An intentionally wrong certificate ID proves device authentication without
     // preparing/committing a rotation, claiming commands, or retrieving site data.
     let body = serde_json::json!({"certificate_id": WRONG_CERTIFICATE});
-    let result = client.post(ENDPOINT)
+    let result = client.post(endpoint())
         .header("x-nexus-device-id", DEVICE)
         .header("x-nexus-device-secret", &credential.device_secret)
         .json(&body).send().await.context("HTTPS test with CAAM-unsealed disposable credential")?;
@@ -166,7 +170,7 @@ async fn check_cloud() -> Result<()> {
     println!("SA-15T NATIVE RUST REAL CLOUD AUTHENTICATION: PASS (HTTP 409 wrong certificate)");
     let mut bogus = credential.device_secret.clone();
     bogus.replace_range(5..6, if &bogus[5..6] == "0" {"1"} else {"0"});
-    let rejected = client.post(ENDPOINT)
+    let rejected = client.post(endpoint())
         .header("x-nexus-device-id", DEVICE)
         .header("x-nexus-device-secret", bogus)
         .json(&body).send().await.context("HTTPS negative authentication test")?;
