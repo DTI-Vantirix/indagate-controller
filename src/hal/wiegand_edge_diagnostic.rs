@@ -213,7 +213,7 @@ fn report(
             .find(|c| c.authorization_eligible && c.format_id == "H10301-26");
         match eligible {
             Some(c) => {
-                let db_path = std::env::var("NEXUS_DB_PATH")
+                let db_path = std::env::var("INDAGATE_DB_PATH").or_else(|_| std::env::var("NEXUS_DB_PATH"))
                     .unwrap_or_else(|_| "/var/lib/highline-nexus/nexus.db".to_string());
                 let outcome = rusqlite::Connection::open_with_flags(
                     &db_path,
