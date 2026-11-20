@@ -10,9 +10,10 @@
 //! thing the Wiegand collector produces, and goes through `card_read::handle` like any
 //! other.
 //!
-//! Not wired into the running controller yet: that needs reader settings from the server
-//! and the board's serial port, which come in later steps.
-#![allow(dead_code)]
+//! `run` serves the readers the configuration names, over the board's RS-485 serial port
+//! (`SerialWire`). With no OSDP reader configured it does nothing. Secure channel is not
+//! offered yet: the configuration is refused if a reader asks for it, because there is no
+//! way so far to give the controller a reader's key.
 
 use anyhow::{Context, Result, bail};
 use libosdp::{Channel, ControlPanel, ControlPanelBuilder, OsdpEvent, OsdpEventCardRead, OsdpFlag, PdInfoBuilder};
@@ -150,6 +151,211 @@ fn card_bits(card: &OsdpEventCardRead) -> Option<Vec<u8>> {
         return None;
     }
     Some((0..count).map(|i| (card.data[i / 8] >> (7 - i % 8)) & 1).collect())
+}
+
+// ---------- the serial line ----------
+
+/// The board's RS-485 serial port as the wire LibOSDP talks over.
+///
+/// The port is opened raw, 8 data bits, no parity, one stop bit, and never blocks. The
+/// kernel is asked to drive the transceiver's direction (RS-485 mode, sending while RTS is
+/// raised); on a port where that is not available the request is skipped and logged, since
+/// some boards switch direction in hardware.
+pub struct SerialWire {
+    port: std::fs::File,
+}
+
+/// `struct serial_rs485` from the Linux serial interface.
+#[repr(C)]
+#[derive(Default)]
+struct SerialRs485 {
+    flags: u32,
+    delay_rts_before_send: u32,
+    delay_rts_after_send: u32,
+    padding: [u32; 5],
+}
+const TIOCSRS485: libc::c_ulong = 0x542F;
+const SER_RS485_ENABLED: u32 = 1;
+const SER_RS485_RTS_ON_SEND: u32 = 1 << 1;
+
+fn speed_constant(baud_rate: u32) -> Option<libc::speed_t> {
+    Some(match baud_rate {
+        9600 => libc::B9600,
+        19200 => libc::B19200,
+        38400 => libc::B38400,
+        57600 => libc::B57600,
+        115200 => libc::B115200,
+        230400 => libc::B230400,
+        _ => return None,
+    })
+}
+
+impl SerialWire {
+    pub fn open(path: &str, baud_rate: u32) -> Result<Self> {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let speed = speed_constant(baud_rate).with_context(|| format!("unsupported line speed {baud_rate}"))?;
+        let port = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NOCTTY | libc::O_NONBLOCK)
+            .open(path)
+            .with_context(|| format!("open serial port {path}"))?;
+        let fd = port.as_raw_fd();
+
+        // SAFETY: `fd` is an open descriptor owned by `port` for the whole block, and each
+        // call is given a properly sized, initialised structure.
+        unsafe {
+            let mut settings: libc::termios = std::mem::zeroed();
+            if libc::tcgetattr(fd, &mut settings) != 0 {
+                bail!("{path} is not a serial port: {}", std::io::Error::last_os_error());
+            }
+            libc::cfmakeraw(&mut settings);
+            settings.c_cflag |= libc::CLOCAL | libc::CREAD;
+            settings.c_cflag &= !(libc::CSTOPB | libc::PARENB | libc::CRTSCTS);
+            settings.c_cc[libc::VMIN] = 0;
+            settings.c_cc[libc::VTIME] = 0;
+            if libc::cfsetispeed(&mut settings, speed) != 0 || libc::cfsetospeed(&mut settings, speed) != 0 {
+                bail!("set line speed on {path}: {}", std::io::Error::last_os_error());
+            }
+            if libc::tcsetattr(fd, libc::TCSANOW, &settings) != 0 {
+                bail!("configure {path}: {}", std::io::Error::last_os_error());
+            }
+            libc::tcflush(fd, libc::TCIOFLUSH);
+
+            let rs485 = SerialRs485 { flags: SER_RS485_ENABLED | SER_RS485_RTS_ON_SEND, ..Default::default() };
+            if libc::ioctl(fd, TIOCSRS485, &rs485) != 0 {
+                warn!(
+                    target: "indagate_osdp",
+                    port = path,
+                    error = %std::io::Error::last_os_error(),
+                    "the serial port did not accept RS-485 mode; relying on the board to switch direction"
+                );
+            }
+        }
+        Ok(Self { port })
+    }
+}
+
+impl Channel for SerialWire {
+    fn get_id(&self) -> i32 {
+        use std::os::fd::AsRawFd;
+        self.port.as_raw_fd()
+    }
+
+    fn read(&mut self, buf: &mut [u8]) -> std::result::Result<usize, libosdp::ChannelError> {
+        use std::io::Read;
+        match self.port.read(buf) {
+            Ok(count) => Ok(count),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(0),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    fn write(&mut self, buf: &[u8]) -> std::result::Result<usize, libosdp::ChannelError> {
+        use std::io::Write;
+        match self.port.write(buf) {
+            Ok(count) => Ok(count),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(0),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Throw away anything received and not yet read.
+    fn flush(&mut self) -> std::result::Result<(), libosdp::ChannelError> {
+        use std::os::fd::AsRawFd;
+        // SAFETY: the descriptor is open for as long as `self.port` lives.
+        unsafe { libc::tcflush(self.port.as_raw_fd(), libc::TCIFLUSH) };
+        Ok(())
+    }
+
+    fn close(&mut self) -> std::result::Result<(), libosdp::ChannelError> {
+        Ok(())
+    }
+}
+
+// ---------- running the readers ----------
+
+/// How often the bus is serviced.
+const POLL_EVERY: std::time::Duration = std::time::Duration::from_millis(20);
+/// How often the reader settings are checked for a change.
+const SETTINGS_CHECK_EVERY: std::time::Duration = std::time::Duration::from_secs(3);
+/// How long to wait before trying again after the bus could not be started.
+const RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Serve the OSDP readers the controller is configured with, for as long as it runs.
+///
+/// With no OSDP reader configured this only checks, every few seconds, whether one has
+/// appeared. When the settings change the bus is closed and started again with the new
+/// ones. A card presented at a reader goes through the same decision as any other.
+pub async fn run(serial_port: &str, db_path: &str, relay_tx: tokio::sync::mpsc::Sender<crate::hal::relay_worker::RelayCommand>) {
+    let db = match crate::storage::ControllerDatabase::open(db_path) {
+        Ok(db) => db,
+        Err(err) => {
+            tracing::error!(target: "indagate_osdp", error = %err, "Unable to open the database for OSDP readers");
+            return;
+        }
+    };
+    loop {
+        let configured = db.osdp_readers().unwrap_or_default();
+        if configured.is_empty() {
+            tokio::time::sleep(SETTINGS_CHECK_EVERY).await;
+            continue;
+        }
+        let mut bus = match open_bus(serial_port, &configured) {
+            Ok(bus) => bus,
+            Err(err) => {
+                tracing::error!(target: "indagate_osdp", error = %err, "OSDP readers could not be started; READERS OFFLINE");
+                tokio::time::sleep(RETRY_AFTER).await;
+                continue;
+            }
+        };
+        tracing::info!(target: "indagate_osdp", readers = configured.len(), port = serial_port, "OSDP readers started");
+
+        let mut links = bus.links();
+        let mut settings_checked = std::time::Instant::now();
+        loop {
+            for read in bus.poll() {
+                super::card_read::handle(read, &db, &relay_tx).await;
+            }
+            let now_links = bus.links();
+            for (before, after) in links.iter().zip(&now_links) {
+                if before != after {
+                    tracing::info!(
+                        target: "indagate_osdp",
+                        reader = after.channel + 1,
+                        online = after.online,
+                        secure = after.secure,
+                        "OSDP reader link changed"
+                    );
+                }
+            }
+            links = now_links;
+            if settings_checked.elapsed() >= SETTINGS_CHECK_EVERY {
+                settings_checked = std::time::Instant::now();
+                if db.osdp_readers().unwrap_or_default() != configured {
+                    tracing::info!(target: "indagate_osdp", "OSDP reader settings changed; restarting the bus");
+                    break;
+                }
+            }
+            tokio::time::sleep(POLL_EVERY).await;
+        }
+    }
+}
+
+/// One bus needs one line speed. The settings come as (channel, address, line speed).
+fn open_bus(serial_port: &str, configured: &[(u8, u8, u32)]) -> Result<OsdpBus> {
+    let baud_rate = configured[0].2;
+    if configured.iter().any(|reader| reader.2 != baud_rate) {
+        bail!("the OSDP readers on one line are set to different speeds");
+    }
+    let readers: Vec<OsdpReader> = configured
+        .iter()
+        .map(|&(channel, address, baud_rate)| OsdpReader { channel, address, baud_rate, secure_channel_key: None })
+        .collect();
+    let wire = SerialWire::open(serial_port, baud_rate)?;
+    OsdpBus::open(Box::new(wire), &readers)
 }
 
 #[cfg(test)]
@@ -401,6 +607,110 @@ mod tests {
         assert!(!links[0].secure);
     }
 
+    /// The controlling end of a pseudo-terminal, standing in for the far end of the cable.
+    struct TerminalEnd(std::fs::File);
+
+    impl Channel for TerminalEnd {
+        fn get_id(&self) -> i32 {
+            9
+        }
+        fn read(&mut self, buf: &mut [u8]) -> Result<usize, ChannelError> {
+            use std::io::Read;
+            match self.0.read(buf) {
+                Ok(count) => Ok(count),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(0),
+                Err(e) => Err(e.into()),
+            }
+        }
+        fn write(&mut self, buf: &[u8]) -> Result<usize, ChannelError> {
+            use std::io::Write;
+            match self.0.write(buf) {
+                Ok(count) => Ok(count),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(0),
+                Err(e) => Err(e.into()),
+            }
+        }
+        fn flush(&mut self) -> Result<(), ChannelError> {
+            Ok(())
+        }
+        fn close(&mut self) -> Result<(), ChannelError> {
+            Ok(())
+        }
+    }
+
+    /// A pseudo-terminal: its controlling end, the path of the end that behaves like a
+    /// serial port, and that end held open so the pair stays connected.
+    fn pseudo_terminal() -> (TerminalEnd, String, std::fs::File) {
+        use std::os::fd::FromRawFd;
+        let (mut controlling, mut port) = (0, 0);
+        let mut name = [0 as libc::c_char; 128];
+        // SAFETY: the pointers are to live locals of the sizes openpty expects; the two
+        // descriptors it returns are owned by the `File`s made from them just below.
+        unsafe {
+            let made = libc::openpty(&mut controlling, &mut port, name.as_mut_ptr(), std::ptr::null(), std::ptr::null());
+            assert_eq!(made, 0, "openpty");
+            let flags = libc::fcntl(controlling, libc::F_GETFL);
+            libc::fcntl(controlling, libc::F_SETFL, flags | libc::O_NONBLOCK);
+            let path = std::ffi::CStr::from_ptr(name.as_ptr()).to_string_lossy().into_owned();
+            (TerminalEnd(std::fs::File::from_raw_fd(controlling)), path, std::fs::File::from_raw_fd(port))
+        }
+    }
+
+    #[test]
+    fn a_card_arrives_over_a_real_serial_port() {
+        let (far_end, port_path, _held_open) = pseudo_terminal();
+        // The controller opens the port the way it opens the board's RS-485 port.
+        let wire = SerialWire::open(&port_path, 9600).expect("open the serial port");
+        let (bits, packed) = card_26(5, 22271);
+        let stop = Arc::new(AtomicBool::new(false));
+        let reader = {
+            let stop = stop.clone();
+            thread::spawn(move || {
+                let info = PdInfoBuilder::new()
+                    .name("simulated")
+                    .unwrap()
+                    .address(7)
+                    .unwrap()
+                    .baud_rate(9600)
+                    .unwrap()
+                    .capability(PdCapability::CommunicationSecurity(PdCapEntity::new(1, 1)));
+                let mut reader = PeripheralDevice::new(info, Box::new(far_end)).expect("simulated reader");
+                reader.set_command_callback(|_| 0);
+                let mut presented = false;
+                while !stop.load(Ordering::Relaxed) {
+                    reader.refresh();
+                    if !presented && reader.is_online() {
+                        let event = OsdpEventCardRead::new_wiegand(26, packed.clone()).unwrap();
+                        reader.notify_event(OsdpEvent::CardRead(event)).expect("present card");
+                        presented = true;
+                    }
+                    thread::sleep(Duration::from_millis(5));
+                }
+            })
+        };
+
+        let mut bus = OsdpBus::open(Box::new(wire), &[reader_on_port_one(None)]).unwrap();
+        let read = wait_for_read(&mut bus);
+        stop.store(true, Ordering::Relaxed);
+        reader.join().unwrap();
+
+        assert_eq!(read.expect("a card read within ten seconds").bits, bits);
+    }
+
+    #[test]
+    fn the_serial_port_refuses_what_is_not_a_serial_port_or_an_odd_speed() {
+        assert!(SerialWire::open("/dev/null", 9600).is_err());
+        assert!(SerialWire::open("/nonexistent/port", 9600).is_err());
+        let (_far_end, port_path, _held_open) = pseudo_terminal();
+        assert!(SerialWire::open(&port_path, 1200).is_err());
+    }
+
+    #[test]
+    fn readers_on_one_line_must_share_a_speed() {
+        let error = open_bus("/nonexistent/port", &[(0, 1, 9600), (1, 2, 115200)]).err().unwrap().to_string();
+        assert!(error.contains("different speeds"), "{error}");
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_card_at_an_osdp_reader_opens_its_door() {
         let (controller_end, reader_end) = memory_wire();
@@ -418,8 +728,8 @@ mod tests {
         db.connection()
             .execute_batch(
                 r#"
-                INSERT INTO reader_config (reader_number, reader_id, enabled, door_channel)
-                    VALUES (1, 'reader1', 1, 0);
+                INSERT INTO reader_config (reader_number, reader_id, enabled, door_channel, protocol, osdp_address, osdp_baud_rate)
+                    VALUES (1, 'reader1', 1, 0, 'osdp', 7, 9600);
                 UPDATE door_config SET unlock_ms = 3000 WHERE channel = 0;
                 INSERT INTO credentials (id, facility_code, card_code, enabled, holder_name)
                     VALUES ('card', 5, 22271, 1, 'Test');

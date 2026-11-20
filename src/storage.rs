@@ -198,7 +198,61 @@ impl ControllerDatabase {
             )?;
         }
 
+        // Reader ports learn which protocol they speak. Rows from before this are Wiegand.
+        let reader_columns: Vec<String> = {
+            let mut stmt = self.conn.prepare("PRAGMA table_info(reader_config)")?;
+            let columns = stmt.query_map([], |row| row.get::<_, String>(1))?;
+            columns.collect::<rusqlite::Result<_>>()?
+        };
+        for (column, definition) in [
+            ("protocol", "TEXT NOT NULL DEFAULT 'wiegand'"),
+            ("osdp_address", "INTEGER"),
+            ("osdp_baud_rate", "INTEGER"),
+        ] {
+            if !reader_columns.iter().any(|existing| existing == column) {
+                self.conn.execute(&format!("ALTER TABLE reader_config ADD COLUMN {column} {definition}"), [])?;
+            }
+        }
+
         Ok(())
+    }
+
+    /// The protocol a reader port is configured for (`wiegand` or `osdp`), or `None` when
+    /// the port has no configuration at all. `channel` is the port number minus one.
+    pub fn reader_protocol(&self, channel: u8) -> Result<Option<String>> {
+        use rusqlite::OptionalExtension;
+
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT protocol FROM reader_config WHERE reader_number = ?1",
+                [i64::from(channel) + 1],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?)
+    }
+
+    /// The enabled OSDP readers: (channel, bus address, line speed), lowest port first.
+    pub fn osdp_readers(&self) -> Result<Vec<(u8, u8, u32)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT reader_number, osdp_address, osdp_baud_rate FROM reader_config
+              WHERE protocol = 'osdp' AND enabled = 1 AND osdp_address IS NOT NULL
+              ORDER BY reader_number",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, Option<i64>>(2)?))
+        })?;
+        let mut readers = Vec::new();
+        for row in rows {
+            let (number, address, baud_rate) = row?;
+            let (Ok(number), Ok(address)) = (u8::try_from(number), u8::try_from(address)) else { continue };
+            if !(1..=4).contains(&number) {
+                continue;
+            }
+            let baud_rate = baud_rate.and_then(|b| u32::try_from(b).ok()).unwrap_or(9600);
+            readers.push((number - 1, address, baud_rate));
+        }
+        Ok(readers)
     }
 
     pub fn door_unlock_ms(&self, channel: u8) -> Result<Option<u64>> {
