@@ -130,6 +130,28 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    // A real diagnostic-only process must never start the normal access stack.
+    // In particular, do not open the Nexus database, initialize relay workers,
+    // schedule unlocks, dispatch cloud door commands, or manipulate outputs.
+    if std::env::var("HLAXS_WIEGAND_EDGE_DIAGNOSTIC").as_deref() == Ok("1") {
+        if args.len() != 1 {
+            return Err(anyhow!(
+                "diagnostic-only mode does not accept controller commands"
+            ));
+        }
+        info!(
+            "HLAXS STRICT DIAGNOSTIC MODE: no access engine, schedules, relay worker, or cloud command agent"
+        );
+        let profile = hal::profile::acp4wr6_r1();
+        // This worker uses the legacy-exported sysfs values in read-only mode.
+        // Its optional uploader is gated independently by HLAXS_V23_CAPTURE_UPLOAD.
+        tokio::task::spawn_blocking(move || hal::wiegand_edge_diagnostic::run(&profile))
+            .await
+            .map_err(|e| anyhow!("diagnostic worker join failed: {e}"))?
+            .map_err(|e| anyhow!("diagnostic worker failed: {e}"))?;
+        return Ok(());
+    }
+
     if relay_command(&args)? {
         return Ok(());
     }

@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use chrono::{Datelike, TimeZone, Timelike, Utc, Weekday};
+use chrono::{DateTime, Datelike, TimeZone, Timelike, Utc, Weekday};
 use chrono_tz::Tz;
 use rusqlite::{Connection, OptionalExtension};
 use serde::Deserialize;
@@ -156,12 +156,12 @@ fn load_schedule(conn: &Connection, schedule_id: &str) -> Result<Option<(Tz, Wee
     Ok(Some((tz, definition)))
 }
 
-fn schedule_active_without_holiday(conn: &Connection, schedule_id: &str) -> Result<bool> {
+fn schedule_active_without_holiday_at(conn: &Connection, schedule_id: &str, now: &DateTime<Utc>) -> Result<bool> {
     let Some((tz, definition)) = load_schedule(conn, schedule_id)? else {
         return Ok(false);
     };
 
-    let local = tz.from_utc_datetime(&Utc::now().naive_utc());
+    let local = tz.from_utc_datetime(&now.naive_utc());
 
     let current_minutes = local.hour() * 60 + local.minute();
 
@@ -223,11 +223,16 @@ fn holiday_action(conn: &Connection, local_date: &str) -> Result<Option<HolidayA
 }
 
 pub fn is_schedule_active(conn: &Connection, schedule_id: &str) -> Result<bool> {
+    is_schedule_active_at(conn, schedule_id, &Utc::now())
+}
+
+// Access decisions use one UTC instant across credentials, holidays, and ranges.
+pub(crate) fn is_schedule_active_at(conn: &Connection, schedule_id: &str, now: &DateTime<Utc>) -> Result<bool> {
     let Some((tz, definition)) = load_schedule(conn, schedule_id)? else {
         return Ok(false);
     };
 
-    let local = tz.from_utc_datetime(&Utc::now().naive_utc());
+    let local = tz.from_utc_datetime(&now.naive_utc());
 
     let local_date = local.date_naive().format("%Y-%m-%d").to_string();
 
@@ -241,7 +246,7 @@ pub fn is_schedule_active(conn: &Connection, schedule_id: &str) -> Result<bool> 
         }
 
         Some(HolidayAction::UseSchedule(override_schedule_id)) => {
-            return schedule_active_without_holiday(conn, &override_schedule_id);
+            return schedule_active_without_holiday_at(conn, &override_schedule_id, now);
         }
 
         None => {}
@@ -254,4 +259,21 @@ pub fn is_schedule_active(conn: &Connection, schedule_id: &str) -> Result<bool> 
         local.weekday(),
         current_minutes,
     ))
+}
+
+// Do not allow a grant on one access level to hide a holiday denial on another.
+// If a mapping has no valid schedule, the normal schedule check rejects it.
+pub(crate) fn is_holiday_denied_at(conn: &Connection, schedule_id: &str, now: &DateTime<Utc>) -> Result<bool> {
+    let Some((tz, _)) = load_schedule(conn, schedule_id)? else {
+        return Ok(true);
+    };
+    let local = tz.from_utc_datetime(&now.naive_utc());
+    let local_date = local.date_naive().format("%Y-%m-%d").to_string();
+    Ok(matches!(holiday_action(conn, &local_date)?, Some(HolidayAction::Deny)))
+}
+
+// An unscheduled mapping cannot determine the correct local holiday date.
+// Preserve historic unscheduled grants only where no holidays exist at all.
+pub(crate) fn has_configured_holidays(conn: &Connection) -> Result<bool> {
+    Ok(conn.query_row("SELECT EXISTS(SELECT 1 FROM holidays)", [], |r| r.get::<_, bool>(0))?)
 }

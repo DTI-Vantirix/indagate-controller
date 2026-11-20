@@ -306,6 +306,7 @@ dependencies = [
  "gpio-cdev",
  "libc",
  "reqwest",
+ "ring",
  "rusqlite",
  "serde",
  "serde_json",

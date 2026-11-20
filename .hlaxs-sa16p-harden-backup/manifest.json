@@ -1,0 +1,12 @@
+{
+  "kind": "SA16P_HARDEN_V1",
+  "original_hashes": {
+    "src/access/engine.rs": "a39a9cff672e3a9a216c91d53e8f72ac95a2979ff5afc22630a7af9a289a816d",
+    "src/access/schedule.rs": "86663513654f1e3c0246868cf9c448fbf2ddce631ee786344d04ee96fc962af7"
+  },
+  "patched_hashes": {
+    "src/access/engine.rs": "f523ab23f658b5f2098533eb9dcdd21a465e91e872e4c6b1eba2ea15a13ef510",
+    "src/access/schedule.rs": "40387b5332f691ba90262e9ce0800e265034d6db3b7b06235254c6cebf22f9d4"
+  },
+  "runner_sha256": "5b56f1798e32d72433f304a733b62571a77a1cdc084dea0296f5ac7a23a1ba16"
+}

@@ -87,6 +87,9 @@ struct CloudConfiguration {
     doors: Vec<CloudDoor>,
 
     #[serde(default)]
+    readers: Vec<CloudReader>,
+
+    #[serde(default)]
     credentials: Vec<CloudCredential>,
 
     #[serde(default)]
@@ -118,6 +121,19 @@ struct CloudDoor {
 
     #[serde(default)]
     unlock_schedule_id: Option<String>,
+}
+
+// SA16Q READER POLICY V1: all reader authorization fields must arrive
+// explicitly from the validated server-side controller configuration.
+#[derive(Debug, Deserialize)]
+struct CloudReader {
+    id: String,
+    reader_number: u8,
+    door_channel: Option<u8>,
+    door_id: Option<String>,
+    enabled: Option<bool>,
+    protocol: String,
+    configuration: Value,
 }
 
 #[derive(Debug, Deserialize)]
@@ -205,32 +221,11 @@ fn identity_path() -> &'static str {
 }
 
 fn save_identity_atomic(identity: &DeviceIdentity) -> Result<()> {
-    fs::create_dir_all(config_dir())?;
-
-    let target = Path::new(identity_path());
-    let temp = Path::new("/var/lib/highline-nexus/device.json.next");
-
-    let encoded = serde_json::to_vec_pretty(identity)?;
-
-    let mut file = fs::OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .mode(0o600)
-        .open(temp)?;
-
-    file.write_all(&encoded)?;
-    file.sync_all()?;
-    drop(file);
-
-    fs::rename(temp, target)?;
-
-    if let Some(parent) = target.parent() {
-        let directory = fs::File::open(parent)?;
-        directory.sync_all()?;
-    }
-
-    Ok(())
+    // SA-15M live legacy identity guard: no sealed-storage activation.
+    crate::cloud::sa15m_live_identity_gate::enforce_legacy_mode(Path::new(identity_path()))?;
+    // SA-15K: same plaintext JSON format and legacy cloud protocol.
+    // The new persistence adapter is NOT an encrypted-credential migration.
+    crate::cloud::sa15x_startup_router::save_identity(Path::new(identity_path()), identity)
 }
 
 fn api_error(envelope: &ApiEnvelope) -> anyhow::Error {
@@ -256,32 +251,14 @@ async fn parse_response(response: Response) -> Result<ApiEnvelope> {
 }
 
 pub fn load_identity() -> Result<Option<DeviceIdentity>> {
-    let path = Path::new(identity_path());
-
-    if !path.exists() {
-        return Ok(None);
-    }
-
-    let raw = fs::read_to_string(path).context("read Nexus device identity")?;
-
-    let identity =
-        serde_json::from_str::<DeviceIdentity>(&raw).context("decode Nexus device identity")?;
-
-    Ok(Some(identity))
+    // SA-15M live legacy identity guard: no plaintext fallback after marker.
+    crate::cloud::sa15m_live_identity_gate::enforce_legacy_mode(Path::new(identity_path()))?;
+    crate::cloud::sa15x_startup_router::load_identity(Path::new(identity_path()))
 }
 
 fn save_identity(identity: &DeviceIdentity) -> Result<()> {
-    fs::create_dir_all(config_dir())?;
-
-    let tmp = format!("{}.tmp", identity_path());
-
-    fs::write(&tmp, serde_json::to_vec_pretty(identity)?)?;
-
-    fs::set_permissions(&tmp, std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
-
-    fs::rename(tmp, identity_path())?;
-
-    Ok(())
+    // Enrollment and rotation both use the identical fail-closed store.
+    save_identity_atomic(identity)
 }
 
 fn client() -> Result<Client> {
@@ -289,6 +266,8 @@ fn client() -> Result<Client> {
 }
 
 pub async fn enroll(enrollment_token: &str, hardware_serial: &str) -> Result<DeviceIdentity> {
+    // Refuse unsupported sealed mode BEFORE contacting cloud enrollment.
+    crate::cloud::sa15m_live_identity_gate::enforce_legacy_mode(Path::new(identity_path()))?;
     let client = client()?;
 
     let body = json!({
@@ -328,7 +307,9 @@ pub async fn enroll(enrollment_token: &str, hardware_serial: &str) -> Result<Dev
         pending_rotation_command_id: None,
     };
 
-    save_identity(&identity)?;
+    crate::cloud::sa16a_identity_lifecycle::persist_enrollment(
+        Path::new(identity_path()), &identity,
+    )?;
 
     Ok(identity)
 }
@@ -361,6 +342,8 @@ async fn authenticated_post(
 }
 
 async fn finalize_pending_credential_rotation(identity: &mut DeviceIdentity) -> Result<bool> {
+    // Refuse plaintext credential use if a cutover marker is present.
+    crate::cloud::sa15m_live_identity_gate::enforce_legacy_mode(Path::new(identity_path()))?;
     let Some(certificate_id) = identity.pending_certificate_id.clone() else {
         return Ok(false);
     };
@@ -406,7 +389,9 @@ async fn finalize_pending_credential_rotation(identity: &mut DeviceIdentity) -> 
     identity.pending_certificate_id = None;
     identity.pending_rotation_command_id = None;
 
-    save_identity_atomic(identity)?;
+    crate::cloud::sa16a_identity_lifecycle::persist_finalized(
+        Path::new(identity_path()), identity,
+    )?;
 
     info!(
         target: "nexus_cloud",
@@ -453,6 +438,8 @@ fn ensure_no_pending_rotation(identity: &DeviceIdentity) -> Result<()> {
 }
 
 async fn rotate_device_credential(identity: &DeviceIdentity, command_id: &str) -> Result<()> {
+    // Refuse unsupported storage mode BEFORE requesting a replacement.
+    crate::cloud::sa15m_live_identity_gate::enforce_legacy_mode(Path::new(identity_path()))?;
     ensure_no_pending_rotation(identity)?;
     let prepared = authenticated_post(identity, "/v1/credential/rotate/prepare", json!({}))
         .await
@@ -473,7 +460,9 @@ async fn rotate_device_credential(identity: &DeviceIdentity, command_id: &str) -
     //
     // Durably persist NEW before permitting OLD to be revoked.
     //
-    save_identity_atomic(&candidate)?;
+    crate::cloud::sa16a_identity_lifecycle::persist_prepared(
+        Path::new(identity_path()), identity, &candidate, command_id,
+    )?;
 
     //
     // Try to finish immediately.
@@ -1124,6 +1113,46 @@ fn validate_cloud_configuration(config: &CloudConfiguration) -> Result<()> {
         }
     }
 
+    // SA16Q READER POLICY V1: this version supports the pinned SP4 Wiegand
+    // port->door mapping only. It refuses uncommissioned or rewired pins;
+    // arbitrary reader reassignment is not silently treated as supported.
+    if config.readers.len() != 4 {
+        return Err(anyhow!("SA16Q expected exactly four explicit reader policies"));
+    }
+    let mut seen_reader_ports = HashSet::new();
+    let mut seen_reader_ids = HashSet::new();
+    let pins: [((&str,u64),(&str,u64));4] = [
+        (("gpiochip3",23),("gpiochip3",25)),
+        (("gpiochip3",26),("gpiochip0",15)),
+        (("gpiochip4",10),("gpiochip4",26)),
+        (("gpiochip4",27),("gpiochip4",11)),
+    ];
+    for r in &config.readers {
+        if !(1..=4).contains(&r.reader_number) ||
+            !seen_reader_ports.insert(r.reader_number) ||
+            !seen_reader_ids.insert(r.id.as_str()) ||
+            uuid::Uuid::parse_str(&r.id).is_err() ||
+            !r.protocol.eq_ignore_ascii_case("wiegand") ||
+            r.door_channel != Some(r.reader_number - 1) ||
+            r.enabled.is_none() ||
+            r.door_id.as_deref().is_none_or(|x| uuid::Uuid::parse_str(x).is_err()) ||
+            r.configuration.get("validated").and_then(Value::as_bool) != Some(true) ||
+            r.configuration.get("format").and_then(Value::as_str) != Some("Wiegand-26")
+        {
+            return Err(anyhow!("SA16Q reader identity, commissioning or mapping invalid"));
+        }
+        let expected = pins[(r.reader_number-1) as usize];
+        for (field,(chip,line)) in [("d0",expected.0),("d1",expected.1)] {
+            let Some(actual) = r.configuration.get(field) else {
+                return Err(anyhow!("SA16Q reader GPIO configuration missing"));
+            };
+            if actual.get("chip").and_then(Value::as_str)!=Some(chip) ||
+                actual.get("line").and_then(Value::as_u64)!=Some(line) {
+                return Err(anyhow!("SA16Q reader GPIO profile mismatch"));
+            }
+        }
+    }
+
     let schedule_ids: HashSet<String> = config.schedules.iter().map(|s| s.id.clone()).collect();
 
     if schedule_ids.len() != config.schedules.len() {
@@ -1310,6 +1339,21 @@ fn apply_cloud_configuration(
     //
     // Remove relationship rows first.
     //
+    // SA16Q READER POLICY V1: replace identities atomically with credentials,
+    // schedules and the cloud version. A failed transaction cannot partially
+    // activate new or disabled reader policies.
+    tx.execute("DELETE FROM reader_config", [])?;
+    for reader in &config.readers {
+        tx.execute(
+            "INSERT INTO reader_config(reader_number,reader_id,enabled,door_channel) VALUES (?1,?2,?3,?4)",
+            rusqlite::params![
+                i64::from(reader.reader_number), &reader.id,
+                if reader.enabled == Some(true) { 1i64 } else { 0i64 },
+                i64::from(reader.door_channel.ok_or_else(|| anyhow!("reader missing door channel"))?),
+            ],
+        )?;
+    }
+
     tx.execute("DELETE FROM credential_access_levels", [])?;
 
     tx.execute("DELETE FROM access_level_doors", [])?;
@@ -1640,6 +1684,13 @@ async fn sync_config_if_needed(
 }
 
 pub async fn run(db_path: &str, relay_tx: mpsc::Sender<RelayCommand>) {
+    // SA-15X: fail-closed storage mode check before cloud agent startup.
+    // The real runtime remains legacy-only; encrypted preview is lab-only.
+    if let Err(e) = crate::cloud::sa15x_startup_router::startup_preflight(Path::new(identity_path())) {
+        error!(error = %e, "SA-15X identity storage preflight denied cloud agent startup");
+        return;
+    }
+
     let mut identity = match load_identity() {
         Ok(Some(identity)) => identity,
 
@@ -1656,6 +1707,38 @@ pub async fn run(db_path: &str, relay_tx: mpsc::Sender<RelayCommand>) {
             return;
         }
     };
+
+    // SA-15I opt-in metadata-only diagnostic; never reads device_secret.
+    // Exact opt-in value required. Default is completely inert.
+    // Errors in this diagnostic do not alter existing cloud operation.
+    if std::env::var("HLAXS_SA15I_READONLY_AUDIT").ok().as_deref() == Some("lab-only") {
+        let view = super::sa15i_identity_bridge::LegacyMetadata {
+            device_id: &identity.device_id,
+            controller_id: &identity.controller_id,
+            pending_certificate_id: identity.pending_certificate_id.as_deref(),
+            pending_rotation_command_id: identity.pending_rotation_command_id.as_deref(),
+        };
+        match super::sa15i_identity_bridge::audit_metadata(view, None) {
+            Ok(decision) => info!(
+                target: "nexus_cloud",
+                pending_recovery = matches!(decision.route, super::sa15i_identity_bridge::RecoveryRoute::PendingReplacementMustCommit),
+                synthetic_snapshot_checked = decision.synthetic_snapshot_checked,
+                live_migration_permitted = decision.live_migration_permitted,
+                "SA-15I read-only identity lifecycle audit (no migration)"
+            ),
+            Err(_) => warn!(
+                target: "nexus_cloud",
+                "SA-15I read-only identity metadata validation unavailable; live cloud flow unchanged"
+            ),
+        }
+    }
+
+    // SA-16A: reject malformed durable pending rotation state before networking.
+    // Existing startup commit/ACK replay is NOT replaced or bypassed.
+    if let Err(e) = crate::cloud::sa16a_identity_lifecycle::validate_startup_state(&identity) {
+        error!(error = %e, "SA-16A identity lifecycle validation failed");
+        return;
+    }
 
     let db = match NexusDatabase::open(db_path) {
         Ok(db) => db,
@@ -1758,7 +1841,8 @@ pub async fn run(db_path: &str, relay_tx: mpsc::Sender<RelayCommand>) {
         }
     }
 
-    let mut checkin_timer = interval(Duration::from_secs(30));
+    // SA-16N LAB FAST CLOUD POLL: SA-16N CHECKIN GATED SYNC R3; check-in 30s -> 3s (bench), commands/events remain 5s.
+    let mut checkin_timer = interval(Duration::from_secs(3));
 
     let mut command_timer = interval(Duration::from_secs(5));
 

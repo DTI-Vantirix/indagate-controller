@@ -37,6 +37,17 @@ impl NexusDatabase {
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
 
+            -- SA16Q READER POLICY V1: no default rows. An uncommissioned port
+            -- cannot grant access before an authenticated cloud snapshot installs
+            -- the explicit policy into this same SQLite database.
+            CREATE TABLE IF NOT EXISTS reader_config (
+                reader_number INTEGER PRIMARY KEY CHECK(reader_number BETWEEN 1 AND 4),
+                reader_id TEXT NOT NULL UNIQUE,
+                enabled INTEGER NOT NULL CHECK(enabled IN (0,1)),
+                door_channel INTEGER NOT NULL CHECK(door_channel BETWEEN 0 AND 3),
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+
             CREATE TABLE IF NOT EXISTS credentials (
                 id TEXT PRIMARY KEY,
                 facility_code INTEGER NOT NULL,
