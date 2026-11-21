@@ -5,7 +5,7 @@
 //! on a grant and queues the event for upload. Wiegand feeds it today; OSDP readers feed it
 //! the same way.
 //!
-//! Only 26-bit cards (H10301: 8-bit facility code, 16-bit card number) are understood.
+//! Which card layouts are understood, and how each is checked, is `access::card_formats`.
 
 use chrono::Utc;
 use rusqlite::params;
@@ -14,6 +14,7 @@ use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
+use crate::access::card_formats;
 use crate::access::engine::{self, AccessDecision};
 use crate::storage::ControllerDatabase;
 
@@ -67,49 +68,24 @@ fn with_source(mut payload: serde_json::Value, source: ReadSource) -> serde_json
     payload
 }
 
-fn validate_26(bits: &[u8]) -> bool {
-    if bits.len() != 26 {
-        return false;
-    }
-
-    let first_12_ones = bits[1..13].iter().filter(|&&b| b == 1).count();
-
-    let second_12_ones = bits[13..25].iter().filter(|&&b| b == 1).count();
-
-    let leading_parity = bits[0] as usize;
-    let trailing_parity = bits[25] as usize;
-
-    let first_even = (first_12_ones + leading_parity) % 2 == 0;
-
-    let second_odd = (second_12_ones + trailing_parity) % 2 == 1;
-
-    first_even && second_odd
+/// Every bit of the card as one number, as events have always carried it.
+fn full_code(bits: &[u8]) -> u64 {
+    bits.iter().take(64).fold(0, |value, &bit| (value << 1) | u64::from(bit & 1))
 }
 
-fn decode_26(bits: &[u8]) -> Option<(u8, u16, u32, bool)> {
-    if bits.len() != 26 {
-        return None;
+/// Events for the 26-bit layout stay exactly as they always were; other layouts say which
+/// they are.
+fn with_format(mut payload: serde_json::Value, format: &str) -> serde_json::Value {
+    if format != engine::DEFAULT_CARD_FORMAT {
+        if let Some(map) = payload.as_object_mut() {
+            map.insert("format".into(), json!(format));
+        }
     }
+    payload
+}
 
-    let mut facility: u8 = 0;
-
-    for &bit in &bits[1..9] {
-        facility = (facility << 1) | bit;
-    }
-
-    let mut card: u16 = 0;
-
-    for &bit in &bits[9..25] {
-        card = (card << 1) | bit as u16;
-    }
-
-    let mut full: u32 = 0;
-
-    for &bit in bits {
-        full = (full << 1) | bit as u32;
-    }
-
-    Some((facility, card, full, validate_26(bits)))
+fn as_card(reading: &card_formats::Reading) -> engine::Card<'static> {
+    engine::Card { format: reading.format, facility_code: reading.facility_code, card_code: reading.card_code }
 }
 
 fn bit_string(bits: &[u8]) -> String {
@@ -190,7 +166,8 @@ pub async fn handle(
         }
     }
 
-    let Some((facility, card, full, parity_valid)) = decode_26(&bits) else {
+    let readings = card_formats::readings(&bits);
+    let Some(first) = readings.first().copied() else {
         warn!(
             target: "indagate_wiegand",
             reader = channel + 1,
@@ -218,13 +195,26 @@ pub async fn handle(
         return ReadOutcome::InvalidFrame;
     };
 
+    // A 37-bit card has two readings and the card cannot say which it is: take the one
+    // this controller holds a credential for. Otherwise the first whose check bits agree.
+    let reading = readings
+        .iter()
+        .copied()
+        .find(|r| r.parity_valid && engine::card_is_known(db.connection(), &as_card(r)).unwrap_or(false))
+        .or_else(|| readings.iter().copied().find(|r| r.parity_valid))
+        .unwrap_or(first);
+    let (format, facility, card, parity_valid) = (reading.format, reading.facility_code, reading.card_code, reading.parity_valid);
+    let full = full_code(&bits);
+    // From here on every event also says the layout, when it is not the 26-bit one.
+    let with_source = |payload: serde_json::Value, source: ReadSource| with_format(with_source(payload, source), format);
+
     if !parity_valid {
         warn!(
             target: "indagate_wiegand",
             reader = channel + 1,
             channel = channel,
             source = source.name(),
-            facility_code = facility,
+            facility_code = ?facility,
             card_code = card,
             raw_bits = %raw_bits,
             "Credential rejected: invalid Wiegand parity"
@@ -251,7 +241,7 @@ pub async fn handle(
         return ReadOutcome::InvalidParity;
     }
 
-    match engine::evaluate(db.connection(), facility, card, channel) {
+    match engine::evaluate_card(db.connection(), &as_card(&reading), channel) {
         Ok(result) => {
             let granted = matches!(result.decision, AccessDecision::Grant);
             let event_type = if granted { "access_grant" } else { "access_deny" };
@@ -311,7 +301,7 @@ pub async fn handle(
                 reader = channel + 1,
                 channel = channel,
                 source = source.name(),
-                facility_code = facility,
+                facility_code = ?facility,
                 card_code = card,
                 decision = ?result.decision,
                 reason = %result.reason,
@@ -356,7 +346,7 @@ pub async fn handle(
                 target: "indagate_access",
                 reader = channel + 1,
                 channel = channel,
-                facility_code = facility,
+                facility_code = ?facility,
                 card_code = card,
                 error = %e,
                 "Access engine failure"
@@ -450,21 +440,23 @@ mod tests {
     #[test]
     fn frame_26_helper_builds_valid_frames() {
         let bits = frame_26(5, 22271);
-        assert_eq!(decode_26(&bits), Some((5, 22271, decode_26(&bits).unwrap().2, true)));
+        let reading = card_formats::readings(&bits);
+        assert_eq!((reading[0].format, reading[0].facility_code, reading[0].card_code, reading[0].parity_valid), ("h10301-26", Some(5), 22271, true));
     }
 
     #[tokio::test]
     async fn wrong_length_is_rejected_and_recorded() {
         let db = database();
         let (tx, mut rx) = mpsc::channel(4);
-        let outcome = handle(read(vec![1; 34], ReadSource::Wiegand), &db, &tx).await;
+        // 35 bits is a real card length, but not one this controller decides on.
+        let outcome = handle(read(vec![1; 35], ReadSource::Wiegand), &db, &tx).await;
         assert_eq!(outcome, ReadOutcome::InvalidFrame);
         assert!(rx.try_recv().is_err(), "no relay command");
         let events = events(&db);
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].0, "wiegand_invalid_frame");
         assert_eq!(events[0].1["reason"], "invalid_frame_length");
-        assert_eq!(events[0].1["bits"], 34);
+        assert_eq!(events[0].1["bits"], 35);
     }
 
     #[tokio::test]
@@ -580,6 +572,169 @@ mod tests {
             .execute("UPDATE reader_config SET protocol = 'osdp', osdp_address = 12, osdp_baud_rate = 38400", [])
             .unwrap();
         assert_eq!(db.osdp_readers().unwrap(), vec![(1, 12, 38400, false)]);
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    // ---------- longer card layouts ----------
+
+    use crate::access::card_formats::tests::card as build_card;
+
+    /// As `database_with_one_card`, plus a card of another layout allowed through door 1.
+    fn database_with_card(id: &str, format: &str, facility: i64, card: i64) -> ControllerDatabase {
+        let db = database_with_one_card();
+        db.connection()
+            .execute(
+                "INSERT INTO credentials (id, format, facility_code, card_code, enabled, holder_name) VALUES (?1, ?2, ?3, ?4, 1, 'Long')",
+                rusqlite::params![id, format, facility, card],
+            )
+            .unwrap();
+        db.connection().execute("INSERT INTO credential_access_levels VALUES (?1, 'level1')", [id]).unwrap();
+        db
+    }
+
+    #[tokio::test]
+    async fn a_34_bit_card_opens_its_door_and_the_event_says_its_layout() {
+        let db = database_with_card("long", "h10306-34", 40000, 51234);
+        let (tx, mut rx) = mpsc::channel(4);
+        let bits = build_card(&[(40000, 16), (51234, 16)], 17, 17);
+        let outcome = handle(read(bits, ReadSource::Wiegand), &db, &tx).await;
+        assert_eq!(outcome, ReadOutcome::Granted { relay_command_queued: true });
+        assert!(rx.try_recv().is_ok(), "a relay command");
+        let events = events(&db);
+        assert_eq!(events[0].0, "access_grant");
+        assert_eq!(events[0].1["format"], "h10306-34");
+        assert_eq!(events[0].1["facility_code"], 40000);
+        assert_eq!(events[0].1["card_code"], 51234);
+        assert_eq!(events[0].1["credential_id"], "long");
+        assert_eq!(events[0].1["bits"].as_u64().or(Some(34)), Some(34));
+    }
+
+    #[tokio::test]
+    async fn events_for_26_bit_cards_are_unchanged() {
+        let db = database_with_one_card();
+        let (tx, _rx) = mpsc::channel(4);
+        handle(read(frame_26(5, 22271), ReadSource::Wiegand), &db, &tx).await;
+        let event = &events(&db)[0].1;
+        assert!(event.get("format").is_none(), "no layout field for the 26-bit layout: {event}");
+        assert_eq!(event["full_code"], 0b00000010101010110111111111u64);
+    }
+
+    #[tokio::test]
+    async fn the_same_numbers_under_another_layout_are_a_different_card() {
+        // The database knows facility 5, card 22271 as a 26-bit card only.
+        let db = database_with_one_card();
+        let (tx, mut rx) = mpsc::channel(4);
+        let same_numbers_34_bit = build_card(&[(5, 16), (22271, 16)], 17, 17);
+        let outcome = handle(read(same_numbers_34_bit, ReadSource::Wiegand), &db, &tx).await;
+        assert_eq!(outcome, ReadOutcome::Denied);
+        assert!(rx.try_recv().is_err(), "no relay command");
+        let events = events(&db);
+        assert_eq!(events[0].1["reason"], "credential_not_found");
+        assert_eq!(events[0].1["format"], "h10306-34");
+
+        // And the reverse: a 34-bit credential is not opened by a 26-bit card with its numbers.
+        let db = database();
+        db.connection()
+            .execute_batch(
+                r#"
+                INSERT INTO reader_config (reader_number, reader_id, enabled, door_channel) VALUES (1, 'reader1', 1, 0);
+                INSERT INTO credentials (id, format, facility_code, card_code, enabled) VALUES ('long', 'h10306-34', 5, 22271, 1);
+                INSERT INTO access_levels (id, name, enabled) VALUES ('level1', 'Level', 1);
+                INSERT INTO credential_access_levels VALUES ('long', 'level1');
+                INSERT INTO access_level_doors VALUES ('level1', 0, 'always');
+                INSERT INTO schedules (id, name, timezone, definition_json) VALUES ('always', 'Always', 'America/New_York', '{"always":true}');
+                "#,
+            )
+            .unwrap();
+        let outcome = handle(read(frame_26(5, 22271), ReadSource::Wiegand), &db, &tx).await;
+        assert_eq!(outcome, ReadOutcome::Denied);
+        assert!(rx.try_recv().is_err(), "no relay command");
+    }
+
+    #[tokio::test]
+    async fn a_37_bit_card_is_read_the_way_its_credential_says() {
+        let bits = build_card(&[(1234, 16), (500_000, 19)], 19, 19);
+        let as_one_number = (1234i64 << 19) | 500_000;
+
+        // Held as the layout with a facility code.
+        let db = database_with_card("with-facility", "h10304-37", 1234, 500_000);
+        let (tx, mut rx) = mpsc::channel(4);
+        assert_eq!(handle(read(bits.clone(), ReadSource::Wiegand), &db, &tx).await, ReadOutcome::Granted { relay_command_queued: true });
+        assert!(rx.try_recv().is_ok());
+        assert_eq!(events(&db)[0].1["format"], "h10304-37");
+
+        // Held as the layout without one: the same bits, the other reading.
+        let db = database_with_card("no-facility", "h10302-37", 0, as_one_number);
+        assert_eq!(handle(read(bits.clone(), ReadSource::Wiegand), &db, &tx).await, ReadOutcome::Granted { relay_command_queued: true });
+        assert!(rx.try_recv().is_ok());
+        let event = &events(&db)[0].1;
+        assert_eq!(event["format"], "h10302-37");
+        assert!(event["facility_code"].is_null());
+        assert_eq!(event["card_code"], as_one_number);
+
+        // Held as neither: refused.
+        let db = database_with_one_card();
+        assert_eq!(handle(read(bits, ReadSource::Wiegand), &db, &tx).await, ReadOutcome::Denied);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn a_damaged_long_card_is_refused_before_any_lookup() {
+        let db = database_with_card("long", "h10306-34", 40000, 51234);
+        let (tx, mut rx) = mpsc::channel(4);
+        let mut bits = build_card(&[(40000, 16), (51234, 16)], 17, 17);
+        bits[20] ^= 1;
+        assert_eq!(handle(read(bits, ReadSource::Wiegand), &db, &tx).await, ReadOutcome::InvalidParity);
+        assert!(rx.try_recv().is_err(), "no relay command");
+        assert_eq!(events(&db)[0].1["reason"], "invalid_parity");
+    }
+
+    #[test]
+    fn an_older_database_keeps_its_cards_as_26_bit_ones() {
+        let path = std::env::temp_dir().join(format!("indagate-card-layout-{}.db", Uuid::new_v4()));
+        {
+            // The credentials table as it was before cards had a layout.
+            let old = rusqlite::Connection::open(&path).unwrap();
+            old.execute_batch(
+                r#"
+                CREATE TABLE credentials (
+                    id TEXT PRIMARY KEY,
+                    facility_code INTEGER NOT NULL,
+                    card_code INTEGER NOT NULL,
+                    enabled INTEGER NOT NULL DEFAULT 1,
+                    valid_from TEXT,
+                    valid_until TEXT,
+                    holder_name TEXT,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(facility_code, card_code)
+                );
+                INSERT INTO credentials (id, facility_code, card_code, enabled, holder_name) VALUES ('old', 5, 22271, 1, 'Kept');
+                "#,
+            )
+            .unwrap();
+        }
+        let db = ControllerDatabase::open(path.to_str().unwrap()).unwrap();
+        let kept: (String, i64, i64, String) = db
+            .connection()
+            .query_row("SELECT format, facility_code, card_code, holder_name FROM credentials WHERE id = 'old'", [], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+            })
+            .unwrap();
+        assert_eq!(kept, ("h10301-26".to_string(), 5, 22271, "Kept".to_string()));
+        // The same numbers may now exist once per layout, and still only once within one.
+        db.connection()
+            .execute("INSERT INTO credentials (id, format, facility_code, card_code) VALUES ('long', 'h10306-34', 5, 22271)", [])
+            .unwrap();
+        assert!(db
+            .connection()
+            .execute("INSERT INTO credentials (id, format, facility_code, card_code) VALUES ('dup', 'h10301-26', 5, 22271)", [])
+            .is_err());
+        drop(db);
+        // Opening it again changes nothing.
+        let db = ControllerDatabase::open(path.to_str().unwrap()).unwrap();
+        let count: i64 = db.connection().query_row("SELECT count(*) FROM credentials", [], |r| r.get(0)).unwrap();
+        assert_eq!(count, 2);
         drop(db);
         let _ = std::fs::remove_file(&path);
     }
