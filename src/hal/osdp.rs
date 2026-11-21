@@ -10,13 +10,22 @@
 //! thing the Wiegand collector produces, and goes through `card_read::handle` like any
 //! other.
 //!
+//! After each card the reader is told what to show and sound (`OsdpBus::feedback`): green
+//! and one beep for a grant, red flashes and three beeps for anything else. A reader going
+//! quiet or coming back, and its tamper and power reports, are queued as events
+//! (`reader_online`, `reader_offline`, `reader_tamper`, `reader_tamper_restored`,
+//! `reader_power_failure`, `reader_power_restored`), once per change.
+//!
 //! `run` serves the readers the configuration names, over the board's RS-485 serial port
 //! (`SerialWire`). With no OSDP reader configured it does nothing. Secure channel is not
 //! offered yet: the configuration is refused if a reader asks for it, because there is no
 //! way so far to give the controller a reader's key.
 
 use anyhow::{Context, Result, bail};
-use libosdp::{Channel, ControlPanel, ControlPanelBuilder, OsdpEvent, OsdpEventCardRead, OsdpFlag, PdInfoBuilder};
+use libosdp::{
+    Channel, ControlPanel, ControlPanelBuilder, OsdpCommand, OsdpCommandBuzzer, OsdpCommandLed, OsdpEvent,
+    OsdpEventCardRead, OsdpFlag, OsdpLedColor, OsdpLedParams, OsdpStatusReport, OsdpStatusReportType, PdInfoBuilder,
+};
 use std::sync::mpsc::{Receiver, channel};
 use tracing::warn;
 
@@ -47,12 +56,66 @@ pub struct ReaderLink {
     pub secure: bool,
 }
 
+/// What the reader shows and sounds after a card was presented.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Feedback {
+    /// Steady green for a second and one beep.
+    Granted,
+    /// Three red flashes and three short beeps.
+    Denied,
+}
+
+/// Something a reader reported about itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReaderStatus {
+    pub channel: u8,
+    /// The reader's cover or mounting switch reports interference.
+    pub tamper: bool,
+    /// The reader reports a problem with its power.
+    pub power_failure: bool,
+}
+
+/// The light and buzzer commands for `feedback`. Both are temporary: the reader returns
+/// to its own idle state afterwards, so nothing here has to know what that is.
+fn feedback_commands(feedback: Feedback) -> (OsdpCommandLed, OsdpCommandBuzzer) {
+    // Durations are in tenths of a second.
+    let (color, on, off, total, beeps, beep_on, beep_off) = match feedback {
+        Feedback::Granted => (OsdpLedColor::Green, 10, 0, 10, 1, 2, 1),
+        Feedback::Denied => (OsdpLedColor::Red, 1, 1, 6, 3, 1, 1),
+    };
+    let led = OsdpCommandLed {
+        reader: 0,
+        led_number: 0,
+        temporary: OsdpLedParams {
+            control_code: 2, // set the temporary state and start its timer
+            on_count: on,
+            off_count: off,
+            on_color: color,
+            off_color: OsdpLedColor::None,
+            timer_count: total,
+        },
+        permanent: OsdpLedParams::default(), // control code 0: leave the idle state alone
+    };
+    let buzzer = OsdpCommandBuzzer { reader: 0, control_code: 2, on_count: beep_on, off_count: beep_off, rep_count: beeps };
+    (led, buzzer)
+}
+
+/// The tamper and power flags from a reader's local status report.
+fn local_status(report: &OsdpStatusReport) -> Option<(bool, bool)> {
+    if report.type_ != OsdpStatusReportType::Local || report.nr_entries < 2 {
+        return None;
+    }
+    Some((report.report[0] != 0, report.report[1] != 0))
+}
+
 /// The readers on one RS-485 line.
 pub struct OsdpBus {
     panel: ControlPanel,
     /// Reader port for each reader, in the order LibOSDP numbers them.
     channels: Vec<u8>,
     events: Receiver<(i32, OsdpEvent)>,
+    /// Status reports received and not yet collected with `take_status`.
+    status: Vec<ReaderStatus>,
 }
 
 impl OsdpBus {
@@ -96,7 +159,7 @@ impl OsdpBus {
             0
         });
 
-        Ok(Self { panel, channels: readers.iter().map(|r| r.channel).collect(), events })
+        Ok(Self { panel, channels: readers.iter().map(|r| r.channel).collect(), events, status: Vec::new() })
     }
 
     /// Do one round of protocol work and return the cards presented since the last call.
@@ -109,8 +172,8 @@ impl OsdpBus {
                 warn!(target: "indagate_osdp", reader, "event from an unknown OSDP reader ignored");
                 continue;
             };
-            if let OsdpEvent::CardRead(card) = event {
-                match card_bits(&card) {
+            match event {
+                OsdpEvent::CardRead(card) => match card_bits(&card) {
                     Some(bits) => reads.push(CardRead { channel, bits, source: ReadSource::Osdp }),
                     None => warn!(
                         target: "indagate_osdp",
@@ -118,10 +181,35 @@ impl OsdpBus {
                         bits = card.nr_bits,
                         "OSDP card read with an unusable bit count ignored"
                     ),
+                },
+                OsdpEvent::Status(report) => {
+                    if let Some((tamper, power_failure)) = local_status(&report) {
+                        self.status.push(ReaderStatus { channel, tamper, power_failure });
+                    }
                 }
+                // Key presses and manufacturer replies are not used.
+                _ => {}
             }
         }
         reads
+    }
+
+    /// What the readers reported about themselves since the last call.
+    pub fn take_status(&mut self) -> Vec<ReaderStatus> {
+        std::mem::take(&mut self.status)
+    }
+
+    /// Show and sound the result of a card read at the reader on `channel`. A reader with
+    /// no light or no buzzer simply does not get that half; neither failure matters to
+    /// the decision, which has already been made.
+    pub fn feedback(&mut self, channel: u8, feedback: Feedback) {
+        let Some(reader) = self.channels.iter().position(|c| *c == channel) else { return };
+        let (led, buzzer) = feedback_commands(feedback);
+        for (what, command) in [("light", OsdpCommand::Led(led)), ("buzzer", OsdpCommand::Buzzer(buzzer))] {
+            if let Err(err) = self.panel.send_command(reader as i32, command) {
+                tracing::debug!(target: "indagate_osdp", reader = channel + 1, what, error = %err, "reader feedback not sent");
+            }
+        }
     }
 
     /// The state of each reader's link.
@@ -313,25 +401,40 @@ pub async fn run(serial_port: &str, db_path: &str, relay_tx: tokio::sync::mpsc::
         };
         tracing::info!(target: "indagate_osdp", readers = configured.len(), port = serial_port, "OSDP readers started");
 
-        let mut links = bus.links();
+        let started = std::time::Instant::now();
+        let mut watches: Vec<ReaderWatch> = bus.links().iter().map(|_| ReaderWatch::default()).collect();
         let mut settings_checked = std::time::Instant::now();
         loop {
             for read in bus.poll() {
-                super::card_read::handle(read, &db, &relay_tx).await;
+                let channel = read.channel;
+                let outcome = super::card_read::handle(read, &db, &relay_tx).await;
+                bus.feedback(channel, feedback_for(outcome));
             }
-            let now_links = bus.links();
-            for (before, after) in links.iter().zip(&now_links) {
-                if before != after {
-                    tracing::info!(
-                        target: "indagate_osdp",
-                        reader = after.channel + 1,
-                        online = after.online,
-                        secure = after.secure,
-                        "OSDP reader link changed"
+            // A reader going quiet, coming back, or reporting tamper or a power problem
+            // is recorded as an event, once per change.
+            for (watch, link) in watches.iter_mut().zip(bus.links()) {
+                if let Some(event) = watch.link_event(link.online, started.elapsed()) {
+                    tracing::info!(target: "indagate_osdp", reader = link.channel + 1, event, secure = link.secure, "OSDP reader link changed");
+                    super::card_read::queue_event(
+                        &db,
+                        event,
+                        link.channel,
+                        serde_json::json!({ "reader": link.channel + 1, "source": "osdp", "secure_channel": link.secure }),
                     );
                 }
             }
-            links = now_links;
+            for status in bus.take_status() {
+                let Some(watch) = bus_index(&bus, status.channel).and_then(|i| watches.get_mut(i)) else { continue };
+                for event in watch.status_events(status.tamper, status.power_failure) {
+                    tracing::warn!(target: "indagate_osdp", reader = status.channel + 1, event, "OSDP reader status changed");
+                    super::card_read::queue_event(
+                        &db,
+                        event,
+                        status.channel,
+                        serde_json::json!({ "reader": status.channel + 1, "source": "osdp" }),
+                    );
+                }
+            }
             if settings_checked.elapsed() >= SETTINGS_CHECK_EVERY {
                 settings_checked = std::time::Instant::now();
                 if db.osdp_readers().unwrap_or_default() != configured {
@@ -341,6 +444,68 @@ pub async fn run(serial_port: &str, db_path: &str, relay_tx: tokio::sync::mpsc::
             }
             tokio::time::sleep(POLL_EVERY).await;
         }
+    }
+}
+
+/// How long a reader may take to answer after the bus starts before it is recorded as
+/// offline. Bringing a reader online takes a second or two.
+const OFFLINE_AFTER_START: std::time::Duration = std::time::Duration::from_secs(15);
+
+fn bus_index(bus: &OsdpBus, channel: u8) -> Option<usize> {
+    bus.channels.iter().position(|c| *c == channel)
+}
+
+/// Anything but a grant sounds and shows as a refusal, an unreadable card included.
+fn feedback_for(outcome: super::card_read::ReadOutcome) -> Feedback {
+    match outcome {
+        super::card_read::ReadOutcome::Granted { .. } => Feedback::Granted,
+        _ => Feedback::Denied,
+    }
+}
+
+/// What has already been recorded about one reader, so each change is recorded once.
+#[derive(Debug, Default)]
+struct ReaderWatch {
+    online: Option<bool>,
+    tamper: Option<bool>,
+    power_failure: Option<bool>,
+}
+
+impl ReaderWatch {
+    /// The event to record for the reader's link state, if it is news.
+    fn link_event(&mut self, online: bool, since_start: std::time::Duration) -> Option<&'static str> {
+        match (self.online, online) {
+            (Some(true), true) | (Some(false), false) => None,
+            (_, true) => {
+                self.online = Some(true);
+                Some("reader_online")
+            }
+            (Some(true), false) => {
+                self.online = Some(false);
+                Some("reader_offline")
+            }
+            // Never seen yet: give it time to answer before calling it offline.
+            (None, false) if since_start >= OFFLINE_AFTER_START => {
+                self.online = Some(false);
+                Some("reader_offline")
+            }
+            (None, false) => None,
+        }
+    }
+
+    /// The events to record for a status report. The first report from a healthy reader
+    /// records nothing.
+    fn status_events(&mut self, tamper: bool, power_failure: bool) -> Vec<&'static str> {
+        let mut events = Vec::new();
+        if self.tamper.unwrap_or(false) != tamper {
+            events.push(if tamper { "reader_tamper" } else { "reader_tamper_restored" });
+        }
+        if self.power_failure.unwrap_or(false) != power_failure {
+            events.push(if power_failure { "reader_power_failure" } else { "reader_power_restored" });
+        }
+        self.tamper = Some(tamper);
+        self.power_failure = Some(power_failure);
+        events
     }
 }
 
@@ -750,5 +915,150 @@ mod tests {
             RelayCommand::Pulse { channel, duration_ms, .. } => assert_eq!((channel, duration_ms), (0, 3000)),
             _ => panic!("expected a pulse"),
         }
+    }
+
+    #[test]
+    fn a_grant_is_steady_green_and_one_beep() {
+        let (led, buzzer) = feedback_commands(Feedback::Granted);
+        assert_eq!(led.temporary.control_code, 2);
+        assert_eq!(led.temporary.on_color, OsdpLedColor::Green);
+        assert_eq!((led.temporary.on_count, led.temporary.off_count, led.temporary.timer_count), (10, 0, 10));
+        assert_eq!(led.permanent.control_code, 0, "the reader's idle light is left alone");
+        assert_eq!((buzzer.control_code, buzzer.rep_count), (2, 1));
+    }
+
+    #[test]
+    fn a_refusal_is_three_red_flashes_and_three_beeps() {
+        let (led, buzzer) = feedback_commands(Feedback::Denied);
+        assert_eq!(led.temporary.on_color, OsdpLedColor::Red);
+        assert_eq!((led.temporary.on_count, led.temporary.off_count, led.temporary.timer_count), (1, 1, 6));
+        assert_eq!(led.permanent.control_code, 0);
+        assert_eq!((buzzer.control_code, buzzer.rep_count), (2, 3));
+    }
+
+    #[test]
+    fn only_a_grant_sounds_like_a_grant() {
+        assert_eq!(feedback_for(ReadOutcome::Granted { relay_command_queued: true }), Feedback::Granted);
+        assert_eq!(feedback_for(ReadOutcome::Granted { relay_command_queued: false }), Feedback::Granted);
+        for refused in [ReadOutcome::Denied, ReadOutcome::InvalidFrame, ReadOutcome::InvalidParity, ReadOutcome::EngineError] {
+            assert_eq!(feedback_for(refused), Feedback::Denied);
+        }
+    }
+
+    #[test]
+    fn a_reader_link_is_recorded_once_per_change() {
+        let soon = Duration::from_secs(1);
+        let late = OFFLINE_AFTER_START;
+        let mut watch = ReaderWatch::default();
+        assert_eq!(watch.link_event(false, soon), None, "a reader gets time to answer");
+        assert_eq!(watch.link_event(true, soon), Some("reader_online"));
+        assert_eq!(watch.link_event(true, late), None);
+        assert_eq!(watch.link_event(false, late), Some("reader_offline"));
+        assert_eq!(watch.link_event(false, late), None);
+        assert_eq!(watch.link_event(true, late), Some("reader_online"));
+
+        let mut never_answered = ReaderWatch::default();
+        assert_eq!(never_answered.link_event(false, soon), None);
+        assert_eq!(never_answered.link_event(false, late), Some("reader_offline"));
+        assert_eq!(never_answered.link_event(false, late), None);
+    }
+
+    #[test]
+    fn reader_status_is_recorded_once_per_change() {
+        let mut watch = ReaderWatch::default();
+        assert!(watch.status_events(false, false).is_empty(), "a healthy first report is not news");
+        assert_eq!(watch.status_events(true, false), vec!["reader_tamper"]);
+        assert!(watch.status_events(true, false).is_empty());
+        assert_eq!(watch.status_events(false, true), vec!["reader_tamper_restored", "reader_power_failure"]);
+        assert_eq!(watch.status_events(false, false), vec!["reader_power_restored"]);
+
+        let mut starts_tampered = ReaderWatch::default();
+        assert_eq!(starts_tampered.status_events(true, true), vec!["reader_tamper", "reader_power_failure"]);
+    }
+
+    #[test]
+    fn only_a_local_status_report_carries_tamper_and_power() {
+        let mut report = OsdpStatusReport { type_: OsdpStatusReportType::Local, nr_entries: 2, report: [0; 64] };
+        assert_eq!(local_status(&report), Some((false, false)));
+        report.report[0] = 1;
+        assert_eq!(local_status(&report), Some((true, false)));
+        report.report[1] = 1;
+        assert_eq!(local_status(&report), Some((true, true)));
+        report.nr_entries = 1;
+        assert_eq!(local_status(&report), None);
+        let inputs = OsdpStatusReport { type_: OsdpStatusReportType::Input, nr_entries: 2, report: [1; 64] };
+        assert_eq!(local_status(&inputs), None);
+    }
+
+    /// A simulated reader with a light and a buzzer. It records the commands it is sent,
+    /// and reports tamper once it is online.
+    fn reader_with_light_and_buzzer(
+        wire: MemoryWire,
+        received: Arc<Mutex<Vec<OsdpCommand>>>,
+        stop: Arc<AtomicBool>,
+    ) -> thread::JoinHandle<()> {
+        thread::spawn(move || {
+            let info = PdInfoBuilder::new()
+                .name("simulated")
+                .unwrap()
+                .address(7)
+                .unwrap()
+                .baud_rate(9600)
+                .unwrap()
+                .capability(PdCapability::LedControl(PdCapEntity::new(1, 1)))
+                .capability(PdCapability::AudibleOutput(PdCapEntity::new(1, 1)));
+            let mut reader = PeripheralDevice::new(info, Box::new(wire)).expect("simulated reader");
+            reader.set_command_callback(move |command| {
+                received.lock().unwrap().push(command.clone());
+                0
+            });
+            let mut reported = false;
+            while !stop.load(Ordering::Relaxed) {
+                reader.refresh();
+                if !reported && reader.is_online() {
+                    let mut report = [0u8; 64];
+                    report[0] = 1; // tamper
+                    let status = OsdpStatusReport { type_: OsdpStatusReportType::Local, nr_entries: 2, report };
+                    reader.notify_event(OsdpEvent::Status(status)).expect("report tamper");
+                    reported = true;
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+        })
+    }
+
+    #[test]
+    fn the_reader_gets_its_light_and_buzzer_and_its_tamper_is_heard() {
+        let (controller_end, reader_end) = memory_wire();
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let reader = reader_with_light_and_buzzer(reader_end, received.clone(), stop.clone());
+        let mut bus = OsdpBus::open(Box::new(controller_end), &[reader_on_port_one(None)]).unwrap();
+
+        // Wait for the tamper report, which also proves the reader is online.
+        let mut status = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while status.is_empty() && Instant::now() < deadline {
+            bus.poll();
+            status = bus.take_status();
+            thread::sleep(Duration::from_millis(5));
+        }
+        bus.feedback(0, Feedback::Granted);
+        bus.feedback(5, Feedback::Granted); // no reader on that port: ignored
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while received.lock().unwrap().len() < 2 && Instant::now() < deadline {
+            bus.poll();
+            thread::sleep(Duration::from_millis(5));
+        }
+        stop.store(true, Ordering::Relaxed);
+        reader.join().unwrap();
+
+        assert_eq!(status, vec![ReaderStatus { channel: 0, tamper: true, power_failure: false }]);
+        assert!(bus.take_status().is_empty(), "a report is handed over once");
+        let (led, buzzer) = feedback_commands(Feedback::Granted);
+        let received = received.lock().unwrap();
+        assert!(received.contains(&OsdpCommand::Led(led)), "light command not received: {received:?}");
+        assert!(received.contains(&OsdpCommand::Buzzer(buzzer)), "buzzer command not received: {received:?}");
+        assert_eq!(received.len(), 2);
     }
 }
