@@ -17,9 +17,18 @@
 //! `reader_power_failure`, `reader_power_restored`), once per change.
 //!
 //! `run` serves the readers the configuration names, over the board's RS-485 serial port
-//! (`SerialWire`). With no OSDP reader configured it does nothing. Secure channel is not
-//! offered yet: the configuration is refused if a reader asks for it, because there is no
-//! way so far to give the controller a reader's key.
+//! (`SerialWire`). With no OSDP reader configured it does nothing.
+//!
+//! Secure channel. A reader set to use it gets a key of its own, made on this controller
+//! and kept only here (`osdp_reader_keys` in the controller database; never sent to the
+//! server, never in a command, result, event or log). The key is handed over the standard
+//! way: the reader is put in its install mode, the controller opens one session under the
+//! default key every OSDP reader accepts in that mode, and sends the real key (KEYSET).
+//! That is only allowed for a few minutes after the server asks for it (`enroll_command`).
+//! Until the reader has its key nothing it sends is acted on, and afterwards it is run
+//! enforced: its own key or nothing. A secure reader with no key stays off; it is never
+//! run in the clear. The key is protected by file permissions only, like the controller's
+//! own secret, not by hardware.
 
 use anyhow::{Context, Result, bail};
 use libosdp::{
@@ -35,7 +44,7 @@ use super::card_read::{CardRead, ReadSource};
 const MAX_CARD_BITS: usize = 128;
 
 /// One OSDP reader on a bus.
-#[derive(Debug, Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct OsdpReader {
     /// Reader port this reader stands for (port number minus one), as in `CardRead`.
     pub channel: u8,
@@ -46,6 +55,23 @@ pub struct OsdpReader {
     /// Secure-channel key. With a key the reader must talk encrypted; without one the
     /// exchange is plain.
     pub secure_channel_key: Option<[u8; 16]>,
+    /// The reader has not taken the key yet. The controller may then open one session
+    /// with the default key every OSDP reader accepts in its install mode, to hand the
+    /// real key over. Nothing the reader sends is acted on until that is done.
+    pub enrolling: bool,
+}
+
+/// The key is never printed.
+impl std::fmt::Debug for OsdpReader {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OsdpReader")
+            .field("channel", &self.channel)
+            .field("address", &self.address)
+            .field("baud_rate", &self.baud_rate)
+            .field("has_key", &self.secure_channel_key.is_some())
+            .field("enrolling", &self.enrolling)
+            .finish()
+    }
 }
 
 /// Whether a reader is answering, and whether the exchange is encrypted.
@@ -113,6 +139,9 @@ pub struct OsdpBus {
     panel: ControlPanel,
     /// Reader port for each reader, in the order LibOSDP numbers them.
     channels: Vec<u8>,
+    /// Whether each reader has a secure-channel key, and whether it is still to take it.
+    keyed: Vec<bool>,
+    enrolling: Vec<bool>,
     events: Receiver<(i32, OsdpEvent)>,
     /// Status reports received and not yet collected with `take_status`.
     status: Vec<ReaderStatus>,
@@ -143,7 +172,12 @@ impl OsdpBus {
                 .baud_rate(i32::try_from(reader.baud_rate).context("OSDP baud rate")?)
                 .context("OSDP baud rate")?;
             if let Some(key) = reader.secure_channel_key {
-                info = info.flag(OsdpFlag::EnforceSecure).secure_channel_key(key);
+                info = info.secure_channel_key(key);
+                // Enforced, the default key is never used and a reader that will not talk
+                // encrypted with its own key stays offline.
+                if !reader.enrolling {
+                    info = info.flag(OsdpFlag::EnforceSecure);
+                }
             }
             infos.push(info);
         }
@@ -159,7 +193,14 @@ impl OsdpBus {
             0
         });
 
-        Ok(Self { panel, channels: readers.iter().map(|r| r.channel).collect(), events, status: Vec::new() })
+        Ok(Self {
+            panel,
+            channels: readers.iter().map(|r| r.channel).collect(),
+            keyed: readers.iter().map(|r| r.secure_channel_key.is_some()).collect(),
+            enrolling: readers.iter().map(|r| r.secure_channel_key.is_some() && r.enrolling).collect(),
+            events,
+            status: Vec::new(),
+        })
     }
 
     /// Do one round of protocol work and return the cards presented since the last call.
@@ -172,6 +213,20 @@ impl OsdpBus {
                 warn!(target: "indagate_osdp", reader, "event from an unknown OSDP reader ignored");
                 continue;
             };
+            // A reader that has a key is only listened to over its own encrypted session.
+            // While the key is still being handed over the session may be plain or under
+            // the public default key, so nothing it sends is acted on.
+            let index = reader as usize;
+            if self.keyed[index] && (self.enrolling[index] || !self.panel.is_sc_active(reader)) {
+                if matches!(event, OsdpEvent::CardRead(_)) {
+                    warn!(
+                        target: "indagate_osdp",
+                        reader = channel + 1,
+                        "card read ignored: the reader's encrypted session is not established"
+                    );
+                }
+                continue;
+            }
             match event {
                 OsdpEvent::CardRead(card) => match card_bits(&card) {
                     Some(bits) => reads.push(CardRead { channel, bits, source: ReadSource::Osdp }),
@@ -372,12 +427,21 @@ const SETTINGS_CHECK_EVERY: std::time::Duration = std::time::Duration::from_secs
 /// How long to wait before trying again after the bus could not be started.
 const RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// How long a reader's encrypted session must hold, while its key is being handed over,
+/// before the key counts as taken. A session under the public default key lasts only the
+/// moment it takes to send the real key, so one that holds is under the real key.
+const SECURE_HELD_FOR: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Serve the OSDP readers the controller is configured with, for as long as it runs.
 ///
 /// With no OSDP reader configured this only checks, every few seconds, whether one has
-/// appeared. When the settings change the bus is closed and started again with the new
-/// ones. A card presented at a reader goes through the same decision as any other.
+/// appeared. When the settings or a reader's key change the bus is closed and started
+/// again. A card presented at a reader goes through the same decision as any other.
+///
+/// A reader set to use the secure channel runs only once it has a key: handed over during
+/// a time-limited enrolment (`enroll_command`), then enforced from that point on.
 pub async fn run(serial_port: &str, db_path: &str, relay_tx: tokio::sync::mpsc::Sender<crate::hal::relay_worker::RelayCommand>) {
+    let _ = DATABASE_PATH.set(db_path.to_string());
     let db = match crate::storage::ControllerDatabase::open(db_path) {
         Ok(db) => db,
         Err(err) => {
@@ -385,13 +449,27 @@ pub async fn run(serial_port: &str, db_path: &str, relay_tx: tokio::sync::mpsc::
             return;
         }
     };
+    let current_plan = |db: &crate::storage::ControllerDatabase| {
+        plan(&db.osdp_readers().unwrap_or_default(), |channel| db.osdp_reader_key(channel).ok().flatten(), chrono::Utc::now())
+    };
+    let mut last_waiting: Vec<u8> = Vec::new();
     loop {
-        let configured = db.osdp_readers().unwrap_or_default();
-        if configured.is_empty() {
+        let (readers, waiting) = current_plan(&db);
+        if waiting != last_waiting {
+            for channel in &waiting {
+                tracing::warn!(
+                    target: "indagate_osdp",
+                    reader = channel + 1,
+                    "OSDP reader is set to use the secure channel and has no key yet; it stays off until it is enrolled"
+                );
+            }
+            last_waiting = waiting.clone();
+        }
+        if readers.is_empty() {
             tokio::time::sleep(SETTINGS_CHECK_EVERY).await;
             continue;
         }
-        let mut bus = match open_bus(serial_port, &configured) {
+        let mut bus = match open_bus(serial_port, &readers) {
             Ok(bus) => bus,
             Err(err) => {
                 tracing::error!(target: "indagate_osdp", error = %err, "OSDP readers could not be started; READERS OFFLINE");
@@ -399,12 +477,13 @@ pub async fn run(serial_port: &str, db_path: &str, relay_tx: tokio::sync::mpsc::
                 continue;
             }
         };
-        tracing::info!(target: "indagate_osdp", readers = configured.len(), port = serial_port, "OSDP readers started");
+        tracing::info!(target: "indagate_osdp", readers = readers.len(), port = serial_port, "OSDP readers started");
 
         let started = std::time::Instant::now();
-        let mut watches: Vec<ReaderWatch> = bus.links().iter().map(|_| ReaderWatch::default()).collect();
+        let mut watches: Vec<ReaderWatch> = readers.iter().map(|_| ReaderWatch::default()).collect();
+        let mut secure_since: Vec<Option<std::time::Instant>> = readers.iter().map(|_| None).collect();
         let mut settings_checked = std::time::Instant::now();
-        loop {
+        'bus: loop {
             for read in bus.poll() {
                 let channel = read.channel;
                 let outcome = super::card_read::handle(read, &db, &relay_tx).await;
@@ -412,8 +491,8 @@ pub async fn run(serial_port: &str, db_path: &str, relay_tx: tokio::sync::mpsc::
             }
             // A reader going quiet, coming back, or reporting tamper or a power problem
             // is recorded as an event, once per change.
-            for (watch, link) in watches.iter_mut().zip(bus.links()) {
-                if let Some(event) = watch.link_event(link.online, started.elapsed()) {
+            for (index, link) in bus.links().into_iter().enumerate() {
+                if let Some(event) = watches[index].link_event(link.online, started.elapsed()) {
                     tracing::info!(target: "indagate_osdp", reader = link.channel + 1, event, secure = link.secure, "OSDP reader link changed");
                     super::card_read::queue_event(
                         &db,
@@ -421,6 +500,27 @@ pub async fn run(serial_port: &str, db_path: &str, relay_tx: tokio::sync::mpsc::
                         link.channel,
                         serde_json::json!({ "reader": link.channel + 1, "source": "osdp", "secure_channel": link.secure }),
                     );
+                }
+                // A reader being given its key: once its encrypted session holds, the key
+                // is recorded as taken and the bus restarts with that reader enforced.
+                if readers[index].enrolling {
+                    if !link.secure {
+                        secure_since[index] = None;
+                    } else if secure_since[index].get_or_insert_with(std::time::Instant::now).elapsed() >= SECURE_HELD_FOR {
+                        match db.osdp_mark_enrolled(link.channel) {
+                            Ok(()) => {
+                                tracing::info!(target: "indagate_osdp", reader = link.channel + 1, "OSDP reader has taken its secure-channel key");
+                                super::card_read::queue_event(
+                                    &db,
+                                    "reader_secure_channel_enrolled",
+                                    link.channel,
+                                    serde_json::json!({ "reader": link.channel + 1, "source": "osdp" }),
+                                );
+                                break 'bus;
+                            }
+                            Err(err) => tracing::error!(target: "indagate_osdp", error = %err, "could not record the reader's key as taken"),
+                        }
+                    }
                 }
             }
             for status in bus.take_status() {
@@ -437,7 +537,20 @@ pub async fn run(serial_port: &str, db_path: &str, relay_tx: tokio::sync::mpsc::
             }
             if settings_checked.elapsed() >= SETTINGS_CHECK_EVERY {
                 settings_checked = std::time::Instant::now();
-                if db.osdp_readers().unwrap_or_default() != configured {
+                let (now_readers, now_waiting) = current_plan(&db);
+                if now_readers != readers {
+                    // An enrolment that ran out of time without the reader taking its key.
+                    for reader in readers.iter().filter(|r| r.enrolling) {
+                        if now_waiting.contains(&reader.channel) {
+                            tracing::warn!(target: "indagate_osdp", reader = reader.channel + 1, "OSDP reader enrolment ran out of time");
+                            super::card_read::queue_event(
+                                &db,
+                                "reader_secure_channel_enroll_expired",
+                                reader.channel,
+                                serde_json::json!({ "reader": reader.channel + 1, "source": "osdp" }),
+                            );
+                        }
+                    }
                     tracing::info!(target: "indagate_osdp", "OSDP reader settings changed; restarting the bus");
                     break;
                 }
@@ -445,6 +558,121 @@ pub async fn run(serial_port: &str, db_path: &str, relay_tx: tokio::sync::mpsc::
             tokio::time::sleep(POLL_EVERY).await;
         }
     }
+}
+
+/// How each configured reader is to be run right now, and the reader ports that must wait
+/// because they are set to use the secure channel and have no usable key.
+///
+/// `configured` is (channel, address, line speed, secure channel required).
+fn plan(
+    configured: &[(u8, u8, u32, bool)],
+    key_of: impl Fn(u8) -> Option<crate::storage::OsdpReaderKey>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> (Vec<OsdpReader>, Vec<u8>) {
+    let mut readers = Vec::new();
+    let mut waiting = Vec::new();
+    for &(channel, address, baud_rate, secure) in configured {
+        let reader = |secure_channel_key, enrolling| OsdpReader { channel, address, baud_rate, secure_channel_key, enrolling };
+        if !secure {
+            readers.push(reader(None, false));
+            continue;
+        }
+        match key_of(channel) {
+            Some(key) if key.active => readers.push(reader(Some(key.key), false)),
+            Some(key) if key.enroll_until.is_some_and(|until| now < until) => readers.push(reader(Some(key.key), true)),
+            // No key, or one whose hand-over time has passed: never run in the clear.
+            _ => waiting.push(channel),
+        }
+    }
+    (readers, waiting)
+}
+
+// ---------- commands from the server ----------
+
+/// Where the controller's database is, for the commands below (set when `run` starts).
+static DATABASE_PATH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// How long a key may be handed over for after an enrolment is asked for.
+const ENROLL_WINDOW_SECONDS: i64 = 600;
+const ENROLL_WINDOW_RANGE: std::ops::RangeInclusive<i64> = 60..=3600;
+
+fn command_database() -> Result<crate::storage::ControllerDatabase> {
+    let path = DATABASE_PATH.get().context("OSDP readers are not running on this controller")?;
+    crate::storage::ControllerDatabase::open(path)
+}
+
+/// The reader port a command names (`reader_number`, 1 upward) as a channel.
+fn command_channel(payload: &serde_json::Value) -> Result<u8> {
+    payload
+        .get("reader_number")
+        .and_then(serde_json::Value::as_u64)
+        .filter(|n| (1..=4).contains(n))
+        .map(|n| n as u8 - 1)
+        .context("reader_number must be a reader port from 1 to 4")
+}
+
+/// Command `osdp_reader_enroll`: make a secure-channel key for a reader and hand it over
+/// during the next few minutes. The reader must be put in its install mode (see its
+/// manual) while that time runs. Payload: `reader_number`, optional `window_seconds`.
+pub fn enroll_command(payload: &serde_json::Value) -> Result<serde_json::Value> {
+    enroll(&command_database()?, payload, chrono::Utc::now())
+}
+
+/// Command `osdp_reader_forget_key`: forget the key held for a reader, for when the
+/// reader was replaced or reset. Payload: `reader_number`.
+pub fn forget_key_command(payload: &serde_json::Value) -> Result<serde_json::Value> {
+    forget_key(&command_database()?, payload)
+}
+
+fn enroll(
+    db: &crate::storage::ControllerDatabase,
+    payload: &serde_json::Value,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<serde_json::Value> {
+    let channel = command_channel(payload)?;
+    let window = match payload.get("window_seconds") {
+        None | Some(serde_json::Value::Null) => ENROLL_WINDOW_SECONDS,
+        Some(value) => value
+            .as_i64()
+            .filter(|seconds| ENROLL_WINDOW_RANGE.contains(seconds))
+            .context("window_seconds must be from 60 to 3600")?,
+    };
+    match db.osdp_readers()?.into_iter().find(|reader| reader.0 == channel) {
+        None => bail!("reader {} is not an enabled OSDP reader", channel + 1),
+        Some((_, _, _, false)) => bail!("reader {} is not set to use the secure channel", channel + 1),
+        Some(_) => {}
+    }
+    let key = match db.osdp_reader_key(channel)? {
+        Some(held) if held.active => bail!(
+            "reader {} already has a key; if the reader was replaced or reset, forget its key first",
+            channel + 1
+        ),
+        // Asked again before the reader took it: the same key, with more time.
+        Some(held) => held.key,
+        None => {
+            use ring::rand::SecureRandom;
+            let mut key = [0u8; 16];
+            ring::rand::SystemRandom::new().fill(&mut key).map_err(|_| anyhow::anyhow!("no random source for a key"))?;
+            key
+        }
+    };
+    let until = now + chrono::Duration::seconds(window);
+    db.osdp_begin_enrollment(channel, key, until)?;
+    Ok(serde_json::json!({
+        "message": "put the reader in its install mode now; the key is handed over when it answers",
+        "reader_number": channel + 1,
+        "enroll_until": until.to_rfc3339(),
+    }))
+}
+
+fn forget_key(db: &crate::storage::ControllerDatabase, payload: &serde_json::Value) -> Result<serde_json::Value> {
+    let channel = command_channel(payload)?;
+    let had_key = db.osdp_forget_key(channel)?;
+    Ok(serde_json::json!({
+        "message": if had_key { "key forgotten; the reader stays off until it is enrolled again" } else { "no key was held for this reader" },
+        "reader_number": channel + 1,
+        "had_key": had_key,
+    }))
 }
 
 /// How long a reader may take to answer after the bus starts before it is recorded as
@@ -509,18 +737,14 @@ impl ReaderWatch {
     }
 }
 
-/// One bus needs one line speed. The settings come as (channel, address, line speed).
-fn open_bus(serial_port: &str, configured: &[(u8, u8, u32)]) -> Result<OsdpBus> {
-    let baud_rate = configured[0].2;
-    if configured.iter().any(|reader| reader.2 != baud_rate) {
+/// One bus needs one line speed.
+fn open_bus(serial_port: &str, readers: &[OsdpReader]) -> Result<OsdpBus> {
+    let baud_rate = readers[0].baud_rate;
+    if readers.iter().any(|reader| reader.baud_rate != baud_rate) {
         bail!("the OSDP readers on one line are set to different speeds");
     }
-    let readers: Vec<OsdpReader> = configured
-        .iter()
-        .map(|&(channel, address, baud_rate)| OsdpReader { channel, address, baud_rate, secure_channel_key: None })
-        .collect();
     let wire = SerialWire::open(serial_port, baud_rate)?;
-    OsdpBus::open(Box::new(wire), &readers)
+    OsdpBus::open(Box::new(wire), readers)
 }
 
 #[cfg(test)]
@@ -650,7 +874,7 @@ mod tests {
     }
 
     fn reader_on_port_one(key: Option<[u8; 16]>) -> OsdpReader {
-        OsdpReader { channel: 0, address: 7, baud_rate: 9600, secure_channel_key: key }
+        OsdpReader { channel: 0, address: 7, baud_rate: 9600, secure_channel_key: key, enrolling: false }
     }
 
     #[test]
@@ -872,7 +1096,9 @@ mod tests {
 
     #[test]
     fn readers_on_one_line_must_share_a_speed() {
-        let error = open_bus("/nonexistent/port", &[(0, 1, 9600), (1, 2, 115200)]).err().unwrap().to_string();
+        let slow = OsdpReader { channel: 0, address: 1, baud_rate: 9600, secure_channel_key: None, enrolling: false };
+        let fast = OsdpReader { channel: 1, address: 2, baud_rate: 115200, ..slow.clone() };
+        let error = open_bus("/nonexistent/port", &[slow, fast]).err().unwrap().to_string();
         assert!(error.contains("different speeds"), "{error}");
     }
 
@@ -1060,5 +1286,186 @@ mod tests {
         assert!(received.contains(&OsdpCommand::Led(led)), "light command not received: {received:?}");
         assert!(received.contains(&OsdpCommand::Buzzer(buzzer)), "buzzer command not received: {received:?}");
         assert_eq!(received.len(), 2);
+    }
+
+    // ---------- secure channel: handing a reader its key ----------
+
+    impl MemoryWire {
+        /// Another handle on the same end of the wire, for a bus opened after the first
+        /// one is closed.
+        fn again(&self) -> MemoryWire {
+            MemoryWire { id: self.id, outgoing: self.outgoing.clone(), incoming: self.incoming.clone() }
+        }
+        fn drain(&self) {
+            self.outgoing.lock().unwrap().clear();
+            self.incoming.lock().unwrap().clear();
+        }
+    }
+
+    /// Poll `bus` until the reader's encrypted session has held for a second, or `limit`
+    /// passes. Returns whether it did, and every card read handed out meanwhile.
+    fn wait_for_secure(bus: &mut OsdpBus, limit: Duration) -> (bool, Vec<CardRead>) {
+        let deadline = Instant::now() + limit;
+        let mut reads = Vec::new();
+        let mut since: Option<Instant> = None;
+        while Instant::now() < deadline {
+            reads.extend(bus.poll());
+            if bus.links()[0].secure {
+                if since.get_or_insert_with(Instant::now).elapsed() >= Duration::from_secs(1) {
+                    return (true, reads);
+                }
+            } else {
+                since = None;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        (false, reads)
+    }
+
+    #[test]
+    fn a_new_reader_is_given_its_key_and_from_then_on_answers_only_to_it() {
+        let (controller_end, reader_end) = memory_wire();
+        let (_, packed) = card_26(5, 22271);
+        let stop = Arc::new(AtomicBool::new(false));
+        // A reader with no key of its own: in its install mode, as it comes out of the box.
+        // It presents a card as soon as it is online, before it has been given a key.
+        let reader = simulated_reader(reader_end, 7, None, packed, 26, stop.clone());
+
+        // Enrolment: the controller holds a key the reader does not have yet.
+        let enrolling = OsdpReader { enrolling: true, ..reader_on_port_one(Some(KEY)) };
+        let mut bus = OsdpBus::open(Box::new(controller_end.again()), &[enrolling]).unwrap();
+        let (handed_over, reads_meanwhile) = wait_for_secure(&mut bus, Duration::from_secs(15));
+        drop(bus);
+        controller_end.drain();
+
+        // Afterwards the reader is run enforced: no default key, encrypted or nothing.
+        let mut bus = OsdpBus::open(Box::new(controller_end.again()), &[reader_on_port_one(Some(KEY))]).unwrap();
+        let (secure_with_its_key, _) = wait_for_secure(&mut bus, Duration::from_secs(15));
+        drop(bus);
+        controller_end.drain();
+
+        // And it is no longer in install mode: another key cannot be pushed onto it.
+        let mut other_key = KEY;
+        other_key[0] ^= 0xff;
+        let takeover = OsdpReader { enrolling: true, ..reader_on_port_one(Some(other_key)) };
+        let mut bus = OsdpBus::open(Box::new(controller_end.again()), &[takeover]).unwrap();
+        let (taken_over, _) = wait_for_secure(&mut bus, Duration::from_secs(4));
+
+        stop.store(true, Ordering::Relaxed);
+        reader.join().unwrap();
+
+        assert!(handed_over, "the reader never came up encrypted during enrolment");
+        assert!(reads_meanwhile.is_empty(), "a card read during the hand-over was acted on: {reads_meanwhile:?}");
+        assert!(secure_with_its_key, "the reader did not answer to the key it was given");
+        assert!(!taken_over, "a second key was accepted by a reader that already has one");
+    }
+
+    fn held(active: bool, until_seconds_from_now: Option<i64>, now: chrono::DateTime<chrono::Utc>) -> crate::storage::OsdpReaderKey {
+        crate::storage::OsdpReaderKey {
+            key: KEY,
+            active,
+            enroll_until: until_seconds_from_now.map(|s| now + chrono::Duration::seconds(s)),
+        }
+    }
+
+    #[test]
+    fn a_secure_reader_runs_only_with_a_key_and_never_in_the_clear() {
+        let now = chrono::Utc::now();
+        let configured = [(0, 1, 9600, false), (1, 2, 9600, true), (2, 3, 9600, true), (3, 4, 9600, true)];
+        let (readers, waiting) = plan(
+            &configured,
+            |channel| match channel {
+                1 => Some(held(true, None, now)),      // has taken its key
+                2 => Some(held(false, Some(60), now)), // being handed its key
+                _ => None,                             // secure, never enrolled
+            },
+            now,
+        );
+        assert_eq!(waiting, vec![3]);
+        let summary: Vec<(u8, bool, bool)> = readers.iter().map(|r| (r.channel, r.secure_channel_key.is_some(), r.enrolling)).collect();
+        assert_eq!(summary, vec![(0, false, false), (1, true, false), (2, true, true)]);
+
+        // Once the hand-over time has passed the reader waits again rather than run plain.
+        let (readers, waiting) = plan(&[(2, 3, 9600, true)], |_| Some(held(false, Some(-1), now)), now);
+        assert!(readers.is_empty());
+        assert_eq!(waiting, vec![2]);
+    }
+
+    fn database_with_reader(secure: bool) -> ControllerDatabase {
+        let db = ControllerDatabase::open(":memory:").unwrap();
+        db.connection()
+            .execute(
+                "INSERT INTO reader_config (reader_number, reader_id, enabled, door_channel, protocol, osdp_address, osdp_baud_rate, osdp_secure)
+                 VALUES (1, 'reader1', 1, 0, 'osdp', 7, 9600, ?1)",
+                [i64::from(secure)],
+            )
+            .unwrap();
+        db
+    }
+
+    #[test]
+    fn enrolment_makes_a_key_once_and_never_reveals_it() {
+        let db = database_with_reader(true);
+        let now = chrono::Utc::now();
+        let payload = serde_json::json!({ "reader_number": 1 });
+
+        let result = enroll(&db, &payload, now).unwrap();
+        let mut fields: Vec<&String> = result.as_object().unwrap().keys().collect();
+        fields.sort();
+        assert_eq!(fields, ["enroll_until", "message", "reader_number"], "the result holds no key");
+        let first = db.osdp_reader_key(0).unwrap().unwrap();
+        assert!(!first.active);
+        assert_eq!(first.enroll_until.unwrap().timestamp(), (now + chrono::Duration::seconds(600)).timestamp());
+        assert_ne!(first.key, [0u8; 16]);
+
+        // Asked again before the reader took it: the same key, more time.
+        let later = now + chrono::Duration::seconds(120);
+        enroll(&db, &serde_json::json!({ "reader_number": 1, "window_seconds": 900 }), later).unwrap();
+        let second = db.osdp_reader_key(0).unwrap().unwrap();
+        assert_eq!(second.key, first.key);
+        assert_eq!(second.enroll_until.unwrap().timestamp(), (later + chrono::Duration::seconds(900)).timestamp());
+
+        // Once the reader has it, a new enrolment is refused and the key is kept.
+        db.osdp_mark_enrolled(0).unwrap();
+        let refused = enroll(&db, &payload, now).unwrap_err().to_string();
+        assert!(refused.contains("already has a key"), "{refused}");
+        let kept = db.osdp_reader_key(0).unwrap().unwrap();
+        assert!(kept.active);
+        assert_eq!(kept.key, first.key);
+        db.osdp_begin_enrollment(0, [9; 16], now).unwrap();
+        assert_eq!(db.osdp_reader_key(0).unwrap().unwrap().key, first.key, "a taken key is never overwritten");
+
+        // Forgetting it lets the reader be enrolled again, with a different key.
+        assert_eq!(forget_key(&db, &payload).unwrap()["had_key"], true);
+        assert_eq!(forget_key(&db, &payload).unwrap()["had_key"], false);
+        enroll(&db, &payload, now).unwrap();
+        assert_ne!(db.osdp_reader_key(0).unwrap().unwrap().key, first.key);
+    }
+
+    #[test]
+    fn enrolment_is_refused_for_the_wrong_reader_or_a_bad_request() {
+        let now = chrono::Utc::now();
+        let plain = database_with_reader(false);
+        let error = enroll(&plain, &serde_json::json!({ "reader_number": 1 }), now).unwrap_err().to_string();
+        assert!(error.contains("not set to use the secure channel"), "{error}");
+
+        let db = database_with_reader(true);
+        let error = enroll(&db, &serde_json::json!({ "reader_number": 2 }), now).unwrap_err().to_string();
+        assert!(error.contains("not an enabled OSDP reader"), "{error}");
+        for bad in [serde_json::json!({}), serde_json::json!({ "reader_number": 0 }), serde_json::json!({ "reader_number": 5 }), serde_json::json!({ "reader_number": "1" })] {
+            assert!(enroll(&db, &bad, now).is_err(), "{bad}");
+            assert!(forget_key(&db, &bad).is_err(), "{bad}");
+        }
+        for bad_window in [0, 59, 3601, -5] {
+            assert!(enroll(&db, &serde_json::json!({ "reader_number": 1, "window_seconds": bad_window }), now).is_err());
+        }
+        assert!(db.osdp_reader_key(0).unwrap().is_none(), "a refused request leaves no key behind");
+    }
+
+    #[test]
+    fn a_reader_description_never_prints_its_key() {
+        let printed = format!("{:?}", reader_on_port_one(Some(KEY)));
+        assert!(printed.contains("has_key: true"), "{printed}");
+        assert!(!printed.contains("148") && !printed.contains("0x94"), "{printed}");
     }
 }

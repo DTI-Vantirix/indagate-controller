@@ -156,7 +156,7 @@ const OSDP_DEFAULT_BAUD_RATE: u32 = 9600;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReaderLink {
     Wiegand,
-    Osdp { address: u8, baud_rate: u32 },
+    Osdp { address: u8, baud_rate: u32, secure: bool },
 }
 
 impl ReaderLink {
@@ -205,12 +205,7 @@ fn reader_link(r: &CloudReader, pins: ((&str, u64), (&str, u64))) -> Result<Read
                 .filter(|b| OSDP_BAUD_RATES.contains(b))
                 .ok_or_else(|| anyhow!("OSDP reader line speed is not one this controller supports"))?,
         };
-        if r.osdp_secure_channel == Some(true) {
-            // Refused rather than run in the clear: there is no way yet to give the
-            // controller the reader's key.
-            return Err(anyhow!("OSDP secure channel is not supported by this firmware yet"));
-        }
-        return Ok(ReaderLink::Osdp { address, baud_rate });
+        return Ok(ReaderLink::Osdp { address, baud_rate, secure: r.osdp_secure_channel == Some(true) });
     }
     Err(anyhow!("SA16Q reader identity, commissioning or mapping invalid"))
 }
@@ -679,6 +674,8 @@ async fn upload_events(identity: &DeviceIdentity, db: &ControllerDatabase) -> Re
             | "reader_tamper_restored"
             | "reader_power_failure"
             | "reader_power_restored"
+            | "reader_secure_channel_enrolled"
+            | "reader_secure_channel_enroll_expired"
             | "access_error"
             | "rex_error"
             | "rex_ignored" => "system",
@@ -831,6 +828,12 @@ async fn handle_command(
             "controller_sync" => Ok(json!({
                 "message": "configuration synchronization requested"
             })),
+
+            // OSDP secure channel: make a key for a reader and hand it over while the
+            // reader is in its install mode; or forget the key of a reader that was
+            // replaced. The key itself never appears in a command or a result.
+            "osdp_reader_enroll" => crate::hal::osdp::enroll_command(&command.payload),
+            "osdp_reader_forget_key" => crate::hal::osdp::forget_key_command(&command.payload),
 
             "wifi_profile_preflight" => {
                 let profile_name = command.payload["profile_name"]
@@ -1439,18 +1442,20 @@ fn apply_cloud_configuration(
         // Validation has already accepted these settings; working the link out again here
         // keeps what is stored tied to the same rules.
         let link = reader_link(reader, READER_PINS[usize::from(reader.reader_number - 1)])?;
-        let (osdp_address, osdp_baud_rate) = match link {
-            ReaderLink::Wiegand => (None, None),
-            ReaderLink::Osdp { address, baud_rate } => (Some(i64::from(address)), Some(i64::from(baud_rate))),
+        let (osdp_address, osdp_baud_rate, osdp_secure) = match link {
+            ReaderLink::Wiegand => (None, None, 0i64),
+            ReaderLink::Osdp { address, baud_rate, secure } => {
+                (Some(i64::from(address)), Some(i64::from(baud_rate)), i64::from(secure))
+            }
         };
         tx.execute(
-            "INSERT INTO reader_config(reader_number,reader_id,enabled,door_channel,protocol,osdp_address,osdp_baud_rate)
-             VALUES (?1,?2,?3,?4,?5,?6,?7)",
+            "INSERT INTO reader_config(reader_number,reader_id,enabled,door_channel,protocol,osdp_address,osdp_baud_rate,osdp_secure)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
             rusqlite::params![
                 i64::from(reader.reader_number), &reader.id,
                 if reader.enabled == Some(true) { 1i64 } else { 0i64 },
                 i64::from(reader.door_channel.ok_or_else(|| anyhow!("reader missing door channel"))?),
-                link.protocol(), osdp_address, osdp_baud_rate,
+                link.protocol(), osdp_address, osdp_baud_rate, osdp_secure,
             ],
         )?;
     }
@@ -2145,11 +2150,11 @@ mod reader_link_tests {
         let rs485 = json!({ "transport": "rs485" });
         assert_eq!(
             reader_link(&reader(osdp(json!(7), rs485.clone())), PORT_ONE).unwrap(),
-            ReaderLink::Osdp { address: 7, baud_rate: 9600 }
+            ReaderLink::Osdp { address: 7, baud_rate: 9600, secure: false }
         );
         assert_eq!(
             reader_link(&reader(osdp(json!(126), json!({ "transport": "rs485", "baud_rate": 115200 }))), PORT_ONE).unwrap(),
-            ReaderLink::Osdp { address: 126, baud_rate: 115200 }
+            ReaderLink::Osdp { address: 126, baud_rate: 115200, secure: false }
         );
         for bad_address in [json!(null), json!(127), json!(-1), json!(300)] {
             assert!(reader_link(&reader(osdp(bad_address.clone(), rs485.clone())), PORT_ONE).is_err(), "{bad_address}");
@@ -2160,11 +2165,13 @@ mod reader_link_tests {
     }
 
     #[test]
-    fn secure_channel_is_refused_rather_than_run_in_the_clear() {
+    fn secure_channel_is_carried_into_the_reader_link() {
         let mut secure = osdp(json!(7), json!({ "transport": "rs485" }));
         secure["osdp_secure_channel"] = json!(true);
-        let error = reader_link(&reader(secure), PORT_ONE).unwrap_err().to_string();
-        assert!(error.contains("secure channel"), "{error}");
+        assert_eq!(
+            reader_link(&reader(secure), PORT_ONE).unwrap(),
+            ReaderLink::Osdp { address: 7, baud_rate: 9600, secure: true }
+        );
     }
 
     #[test]

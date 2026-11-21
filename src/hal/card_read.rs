@@ -579,7 +579,7 @@ mod tests {
         db.connection()
             .execute("UPDATE reader_config SET protocol = 'osdp', osdp_address = 12, osdp_baud_rate = 38400", [])
             .unwrap();
-        assert_eq!(db.osdp_readers().unwrap(), vec![(1, 12, 38400)]);
+        assert_eq!(db.osdp_readers().unwrap(), vec![(1, 12, 38400, false)]);
         drop(db);
         let _ = std::fs::remove_file(&path);
     }
