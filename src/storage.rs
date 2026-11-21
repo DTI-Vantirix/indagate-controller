@@ -9,6 +9,16 @@ pub struct ControllerDatabase {
     conn: Connection,
 }
 
+/// A secure-channel key held for one OSDP reader.
+#[derive(Clone, PartialEq, Eq)]
+pub struct OsdpReaderKey {
+    pub key: [u8; 16],
+    /// The reader has taken the key. Otherwise it is still to be handed over.
+    pub active: bool,
+    /// For a key not yet taken: until when the controller may hand it over.
+    pub enroll_until: Option<chrono::DateTime<chrono::Utc>>,
+}
+
 impl ControllerDatabase {
     pub fn open(path: &str) -> Result<Self> {
         if let Some(parent) = Path::new(path).parent() {
@@ -208,13 +218,79 @@ impl ControllerDatabase {
             ("protocol", "TEXT NOT NULL DEFAULT 'wiegand'"),
             ("osdp_address", "INTEGER"),
             ("osdp_baud_rate", "INTEGER"),
+            ("osdp_secure", "INTEGER NOT NULL DEFAULT 0"),
         ] {
             if !reader_columns.iter().any(|existing| existing == column) {
                 self.conn.execute(&format!("ALTER TABLE reader_config ADD COLUMN {column} {definition}"), [])?;
             }
         }
 
+        // Secure-channel keys for OSDP readers. They are made on this controller and never
+        // leave it, so they are kept apart from the configuration, which the server
+        // replaces wholesale.
+        self.conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS osdp_reader_keys (
+                reader_number INTEGER PRIMARY KEY,
+                key BLOB NOT NULL,
+                state TEXT NOT NULL CHECK (state IN ('pending', 'active')),
+                enroll_until TEXT,
+                updated_at TEXT NOT NULL
+            );
+            "#,
+        )?;
+
         Ok(())
+    }
+
+    /// The secure-channel key held for the reader on `channel`: the key, whether the reader
+    /// has taken it (`active`) or is still to be given it (`pending`), and for a pending
+    /// key the time until which the controller may hand it over.
+    pub fn osdp_reader_key(&self, channel: u8) -> Result<Option<OsdpReaderKey>> {
+        use rusqlite::OptionalExtension;
+
+        let row = self
+            .conn
+            .query_row(
+                "SELECT key, state, enroll_until FROM osdp_reader_keys WHERE reader_number = ?1",
+                [i64::from(channel) + 1],
+                |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, String>(1)?, row.get::<_, Option<String>>(2)?)),
+            )
+            .optional()?;
+        let Some((key, state, enroll_until)) = row else { return Ok(None) };
+        let key: [u8; 16] = key.try_into().map_err(|_| anyhow::anyhow!("stored OSDP key has the wrong length"))?;
+        let enroll_until = enroll_until
+            .and_then(|t| chrono::DateTime::parse_from_rfc3339(&t).ok())
+            .map(|t| t.with_timezone(&chrono::Utc));
+        Ok(Some(OsdpReaderKey { key, active: state == "active", enroll_until }))
+    }
+
+    /// Hold `key` for the reader on `channel` as not yet taken, to be handed over until
+    /// `until`. A key the reader has already taken is never overwritten here.
+    pub fn osdp_begin_enrollment(&self, channel: u8, key: [u8; 16], until: chrono::DateTime<chrono::Utc>) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO osdp_reader_keys (reader_number, key, state, enroll_until, updated_at)
+             VALUES (?1, ?2, 'pending', ?3, ?4)
+             ON CONFLICT(reader_number) DO UPDATE SET key = excluded.key, enroll_until = excluded.enroll_until,
+                                                     updated_at = excluded.updated_at
+              WHERE osdp_reader_keys.state = 'pending'",
+            rusqlite::params![i64::from(channel) + 1, key.to_vec(), until.to_rfc3339(), chrono::Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    /// Record that the reader on `channel` has taken its key.
+    pub fn osdp_mark_enrolled(&self, channel: u8) -> Result<()> {
+        self.conn.execute(
+            "UPDATE osdp_reader_keys SET state = 'active', enroll_until = NULL, updated_at = ?2 WHERE reader_number = ?1",
+            rusqlite::params![i64::from(channel) + 1, chrono::Utc::now().to_rfc3339()],
+        )?;
+        Ok(())
+    }
+
+    /// Forget the key held for the reader on `channel`. Returns whether there was one.
+    pub fn osdp_forget_key(&self, channel: u8) -> Result<bool> {
+        Ok(self.conn.execute("DELETE FROM osdp_reader_keys WHERE reader_number = ?1", [i64::from(channel) + 1])? > 0)
     }
 
     /// The protocol a reader port is configured for (`wiegand` or `osdp`), or `None` when
@@ -232,25 +308,26 @@ impl ControllerDatabase {
             .optional()?)
     }
 
-    /// The enabled OSDP readers: (channel, bus address, line speed), lowest port first.
-    pub fn osdp_readers(&self) -> Result<Vec<(u8, u8, u32)>> {
+    /// The enabled OSDP readers: (channel, bus address, line speed, secure channel required),
+    /// lowest port first.
+    pub fn osdp_readers(&self) -> Result<Vec<(u8, u8, u32, bool)>> {
         let mut stmt = self.conn.prepare(
-            "SELECT reader_number, osdp_address, osdp_baud_rate FROM reader_config
+            "SELECT reader_number, osdp_address, osdp_baud_rate, osdp_secure FROM reader_config
               WHERE protocol = 'osdp' AND enabled = 1 AND osdp_address IS NOT NULL
               ORDER BY reader_number",
         )?;
         let rows = stmt.query_map([], |row| {
-            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, Option<i64>>(2)?))
+            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, Option<i64>>(2)?, row.get::<_, i64>(3)?))
         })?;
         let mut readers = Vec::new();
         for row in rows {
-            let (number, address, baud_rate) = row?;
+            let (number, address, baud_rate, secure) = row?;
             let (Ok(number), Ok(address)) = (u8::try_from(number), u8::try_from(address)) else { continue };
             if !(1..=4).contains(&number) {
                 continue;
             }
             let baud_rate = baud_rate.and_then(|b| u32::try_from(b).ok()).unwrap_or(9600);
-            readers.push((number - 1, address, baud_rate));
+            readers.push((number - 1, address, baud_rate, secure != 0));
         }
         Ok(readers)
     }
