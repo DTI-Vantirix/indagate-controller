@@ -213,7 +213,13 @@ fn reader_link(r: &CloudReader, pins: ((&str, u64), (&str, u64))) -> Result<Read
 #[derive(Debug, Deserialize)]
 struct CloudCredential {
     id: String,
-    facility_code: u64,
+    /// The card's layout. Absent means the 26-bit layout every card had before layouts
+    /// were sent.
+    #[serde(default)]
+    format: Option<String>,
+    /// Absent for a layout that has no facility code.
+    #[serde(default)]
+    facility_code: Option<u64>,
     card_code: u64,
 
     #[serde(default = "default_true")]
@@ -227,6 +233,27 @@ struct CloudCredential {
 
     #[serde(default)]
     holder_name: Option<String>,
+}
+
+/// The layout a credential names (the 26-bit one when it names none) and the facility code
+/// to store for it, after checking the numbers fit that layout. A layout with no facility
+/// code must not be sent one, and is stored with facility 0.
+fn credential_card(credential: &CloudCredential) -> Result<(&str, u64)> {
+    use crate::access::card_formats;
+    let format = credential.format.as_deref().unwrap_or(crate::access::engine::DEFAULT_CARD_FORMAT);
+    let limits = card_formats::limits(format)
+        .ok_or_else(|| anyhow!("credential {} has a card layout this firmware does not know: {format}", credential.id))?;
+    let facility = match (limits.max_facility_code, credential.facility_code) {
+        (Some(max), Some(facility)) if facility <= max => facility,
+        (Some(_), Some(_)) => return Err(anyhow!("credential {} facility code exceeds the {format} range", credential.id)),
+        (Some(_), None) => return Err(anyhow!("credential {} needs a facility code for {format}", credential.id)),
+        (None, None) => 0,
+        (None, Some(_)) => return Err(anyhow!("credential {} has a facility code, but {format} has none", credential.id)),
+    };
+    if credential.card_code > limits.max_card_code {
+        return Err(anyhow!("credential {} card code exceeds the {format} range", credential.id));
+    }
+    Ok((format, facility))
 }
 
 #[derive(Debug, Deserialize)]
@@ -1300,22 +1327,12 @@ fn validate_cloud_configuration(config: &CloudConfiguration) -> Result<()> {
             return Err(anyhow!("credential id cannot be empty"));
         }
 
-        if credential.facility_code > 255 {
-            return Err(anyhow!(
-                "credential {} facility code exceeds Wiegand-26 range",
-                credential.id
-            ));
-        }
-
-        if credential.card_code > 65535 {
-            return Err(anyhow!(
-                "credential {} card code exceeds Wiegand-26 range",
-                credential.id
-            ));
-        }
-
-        if !credential_values.insert((credential.facility_code, credential.card_code)) {
-            return Err(anyhow!("duplicate facility/card credential"));
+        // Each layout says what numbers a card of it can hold. A layout this firmware does
+        // not know is refused, never guessed at: the same numbers under another layout
+        // are a different card.
+        let (format, facility) = credential_card(credential)?;
+        if !credential_values.insert((format.to_string(), facility, credential.card_code)) {
+            return Err(anyhow!("duplicate credential (same layout, facility code and card number)"));
         }
 
         validate_timestamp(&credential.valid_from, "credential.valid_from")?;
@@ -1554,30 +1571,17 @@ fn apply_cloud_configuration(
     // Credentials.
     //
     for credential in &config.credentials {
+        // Validation has already accepted these; working it out again keeps what is
+        // stored tied to the same rules.
+        let (format, facility) = credential_card(credential)?;
         tx.execute(
-            r#"
-            INSERT INTO credentials
-            (
-                id,
-                facility_code,
-                card_code,
-                enabled,
-                valid_from,
-                valid_until,
-                holder_name,
-                updated_at
-            )
-            VALUES
-            (
-                ?1, ?2, ?3, ?4,
-                ?5, ?6, ?7,
-                CURRENT_TIMESTAMP
-            )
-            "#,
+            "INSERT INTO credentials (id, format, facility_code, card_code, enabled, valid_from, valid_until, holder_name, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, CURRENT_TIMESTAMP)",
             rusqlite::params![
                 credential.id,
-                credential.facility_code as i64,
-                credential.card_code as i64,
+                format,
+                i64::try_from(facility)?,
+                i64::try_from(credential.card_code)?,
                 if credential.enabled { 1i64 } else { 0i64 },
                 credential.valid_from,
                 credential.valid_until,
@@ -2177,6 +2181,45 @@ mod reader_link_tests {
         );
     }
 
+
+    fn credential(extra: Value) -> CloudCredential {
+        let mut value = json!({ "id": "c1", "card_code": 100 });
+        value.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        serde_json::from_value(value).unwrap()
+    }
+
+    #[test]
+    fn a_credential_without_a_layout_is_the_26_bit_card_it_always_was() {
+        let plain = credential(json!({ "facility_code": 5 }));
+        assert_eq!(credential_card(&plain).unwrap(), ("h10301-26", 5));
+        let too_big = credential(json!({ "facility_code": 256 }));
+        assert!(credential_card(&too_big).unwrap_err().to_string().contains("facility code exceeds"));
+        let card_too_big = credential(json!({ "facility_code": 5, "card_code": 65536 }));
+        assert!(credential_card(&card_too_big).unwrap_err().to_string().contains("card code exceeds"));
+        let no_facility = credential(json!({}));
+        assert!(credential_card(&no_facility).unwrap_err().to_string().contains("needs a facility code"));
+    }
+
+    #[test]
+    fn each_layout_takes_only_numbers_that_fit_it() {
+        let ok = |extra: Value| credential_card(&credential(extra)).map(|(format, facility)| (format.to_string(), facility));
+        assert_eq!(ok(json!({ "format": "h10306-34", "facility_code": 65535, "card_code": 65535 })).unwrap(), ("h10306-34".to_string(), 65535));
+        assert!(ok(json!({ "format": "h10306-34", "facility_code": 65536 })).is_err());
+        assert_eq!(ok(json!({ "format": "h10304-37", "facility_code": 1234, "card_code": 524287 })).unwrap(), ("h10304-37".to_string(), 1234));
+        assert!(ok(json!({ "format": "h10304-37", "facility_code": 1234, "card_code": 524288 })).is_err());
+        // The layout with no facility code is stored with 0 and must not be sent one.
+        assert_eq!(ok(json!({ "format": "h10302-37", "card_code": 34359738367u64 })).unwrap(), ("h10302-37".to_string(), 0));
+        assert!(ok(json!({ "format": "h10302-37", "card_code": 34359738368u64 })).is_err());
+        assert!(ok(json!({ "format": "h10302-37", "facility_code": 0, "card_code": 1 })).unwrap_err().to_string().contains("has none"));
+    }
+
+    #[test]
+    fn a_layout_this_firmware_does_not_know_is_refused_not_guessed() {
+        for unknown in ["corporate-1000-35", "h10301", "", "H10306-34"] {
+            let error = credential_card(&credential(json!({ "format": unknown, "facility_code": 5 }))).unwrap_err().to_string();
+            assert!(error.contains("does not know"), "{unknown}: {error}");
+        }
+    }
     #[test]
     fn an_unknown_protocol_is_refused() {
         let unknown = json!({ "protocol": "clock-and-data", "configuration": {} });

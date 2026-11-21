@@ -232,6 +232,46 @@ impl ControllerDatabase {
             }
         }
 
+        // Cards are matched on their layout as well as their numbers. A database from
+        // before that has no layout column, and a uniqueness rule on the numbers alone;
+        // rebuild the table, keeping every card as the 26-bit layout it could only be.
+        let has_format: bool = {
+            let mut stmt = self.conn.prepare("PRAGMA table_info(credentials)")?;
+            let columns = stmt.query_map([], |row| row.get::<_, String>(1))?;
+            columns.collect::<rusqlite::Result<Vec<String>>>()?.iter().any(|c| c == "format")
+        };
+        if !has_format {
+            self.conn.pragma_update(None, "foreign_keys", "OFF")?;
+            let rebuilt = self.conn.execute_batch(
+                r#"
+                BEGIN;
+                CREATE TABLE credentials_new (
+                    id TEXT PRIMARY KEY,
+                    format TEXT NOT NULL DEFAULT 'h10301-26',
+                    facility_code INTEGER NOT NULL,
+                    card_code INTEGER NOT NULL,
+                    enabled INTEGER NOT NULL DEFAULT 1,
+                    valid_from TEXT,
+                    valid_until TEXT,
+                    holder_name TEXT,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(format, facility_code, card_code)
+                );
+                INSERT INTO credentials_new (id, format, facility_code, card_code, enabled, valid_from, valid_until, holder_name, updated_at)
+                    SELECT id, 'h10301-26', facility_code, card_code, enabled, valid_from, valid_until, holder_name, updated_at FROM credentials;
+                DROP TABLE credentials;
+                ALTER TABLE credentials_new RENAME TO credentials;
+                CREATE INDEX IF NOT EXISTS idx_credentials_lookup ON credentials(format, facility_code, card_code);
+                COMMIT;
+                "#,
+            );
+            self.conn.pragma_update(None, "foreign_keys", "ON")?;
+            if let Err(err) = rebuilt {
+                let _ = self.conn.execute_batch("ROLLBACK;");
+                return Err(err).context("add the card layout to the credentials table");
+            }
+        }
+
         // Secure-channel keys for OSDP readers. They are made on this controller and never
         // leave it, so they are kept apart from the configuration, which the server
         // replaces wholesale.
