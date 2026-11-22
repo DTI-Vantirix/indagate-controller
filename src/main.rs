@@ -130,26 +130,14 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    // A real diagnostic-only process must never start the normal access stack.
-    // In particular, do not open the Indagate database, initialize relay workers,
-    // schedule unlocks, dispatch cloud door commands, or manipulate outputs.
+    // The strict diagnostic mode this switch used to select no longer exists. A controller
+    // still configured for it must not quietly come up as a normal, door-opening controller
+    // instead, so it refuses to start until the setting is removed.
     if std::env::var("HLAXS_WIEGAND_EDGE_DIAGNOSTIC").as_deref() == Ok("1") {
-        if args.len() != 1 {
-            return Err(anyhow!(
-                "diagnostic-only mode does not accept controller commands"
-            ));
-        }
-        info!(
-            "STRICT DIAGNOSTIC MODE: no access engine, schedules, relay worker, or cloud command agent"
-        );
-        let profile = hal::profile::acp4wr6_r1();
-        // This worker uses the legacy-exported sysfs values in read-only mode.
-        // Its optional uploader is gated independently by HLAXS_V23_CAPTURE_UPLOAD.
-        tokio::task::spawn_blocking(move || hal::wiegand_edge_diagnostic::run(&profile))
-            .await
-            .map_err(|e| anyhow!("diagnostic worker join failed: {e}"))?
-            .map_err(|e| anyhow!("diagnostic worker failed: {e}"))?;
-        return Ok(());
+        return Err(anyhow!(
+            "HLAXS_WIEGAND_EDGE_DIAGNOSTIC=1 is set, but diagnostic mode has been removed; \
+             remove that setting to run the controller normally"
+        ));
     }
 
     if relay_command(&args)? {
