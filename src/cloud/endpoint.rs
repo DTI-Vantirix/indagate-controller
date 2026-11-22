@@ -2,18 +2,18 @@
 //!
 //! Three things live here, all additive to the existing cloud agent:
 //!
-//! * **The server address.** `NEXUS_CLOUD_URL` replaces the built-in address. It must be
-//!   `https://`, except for a loopback address, or when `NEXUS_CLOUD_ALLOW_PLAINTEXT=lab-only`
+//! * **The server address.** `INDAGATE_SERVER_URL` replaces the built-in address. It must be
+//!   `https://`, except for a loopback address, or when `INDAGATE_SERVER_ALLOW_PLAINTEXT=lab-only`
 //!   is set for bench work. A malformed value stops the cloud agent rather than falling back
 //!   to the built-in address: the device secret must never be sent to a server the operator
 //!   did not intend. Local access control keeps working either way.
-//! * **Extra trusted certificate authorities.** `NEXUS_CLOUD_CA_FILE` names a PEM file whose
+//! * **Extra trusted certificate authorities.** `INDAGATE_SERVER_CA_FILE` names a PEM file whose
 //!   certificates are trusted *in addition to* the built-in public roots, so a self-hosted
 //!   server with a private certificate can be used. Certificate checking is never disabled.
 //! * **The push stream.** [`run_stream`] holds `GET /v1/stream` open and turns the server's
 //!   lines into [`Nudge`]s for the agent loop, which then makes the same calls its timers
 //!   make. A nudge is only a hint; if the stream is unavailable the timers still run, so
-//!   nothing depends on it. `NEXUS_CLOUD_PUSH=off` disables it.
+//!   nothing depends on it. `INDAGATE_SERVER_PUSH=off` disables it.
 //!
 //! One HTTP client is shared by all requests, so the TLS connection is reused instead of
 //! being set up again for every call.
@@ -46,35 +46,50 @@ fn resolve_base_url(configured: Option<&str>, allow_plaintext: bool, built_in: &
     let Some(raw) = configured.map(str::trim).filter(|v| !v.is_empty()) else {
         return Ok(built_in.to_string());
     };
-    let url = Url::parse(raw).map_err(|_| anyhow!("NEXUS_CLOUD_URL is not a valid URL"))?;
+    let url = Url::parse(raw).map_err(|_| anyhow!("INDAGATE_SERVER_URL is not a valid URL"))?;
     if url.host().is_none() || url.cannot_be_a_base() {
-        return Err(anyhow!("NEXUS_CLOUD_URL must name a server"));
+        return Err(anyhow!("INDAGATE_SERVER_URL must name a server"));
     }
     if !url.username().is_empty() || url.password().is_some() {
-        return Err(anyhow!("NEXUS_CLOUD_URL must not contain credentials"));
+        return Err(anyhow!("INDAGATE_SERVER_URL must not contain credentials"));
     }
     if url.query().is_some() || url.fragment().is_some() {
-        return Err(anyhow!("NEXUS_CLOUD_URL must not contain a query or fragment"));
+        return Err(anyhow!("INDAGATE_SERVER_URL must not contain a query or fragment"));
     }
     match url.scheme() {
         "https" => {}
         "http" if is_loopback(&url) || allow_plaintext => {}
         "http" => {
             return Err(anyhow!(
-                "NEXUS_CLOUD_URL must use https (the device secret is sent on every request)"
+                "INDAGATE_SERVER_URL must use https (the device secret is sent on every request)"
             ));
         }
-        _ => return Err(anyhow!("NEXUS_CLOUD_URL must be an https address")),
+        _ => return Err(anyhow!("INDAGATE_SERVER_URL must be an https address")),
     }
     Ok(raw.trim_end_matches('/').to_string())
+}
+
+/// A server setting from the environment: `INDAGATE_SERVER_<name>`, or the name used before
+/// the rename, `NEXUS_CLOUD_<name>`. The new name wins when it is set to something; an empty
+/// value counts as not set, as it always has. A malformed new value is reported, never
+/// replaced by the old one.
+fn setting(name: &str) -> Option<String> {
+    pick_setting(
+        std::env::var(format!("INDAGATE_SERVER_{name}")).ok(),
+        std::env::var(format!("NEXUS_CLOUD_{name}")).ok(),
+    )
+}
+
+fn pick_setting(new: Option<String>, old: Option<String>) -> Option<String> {
+    new.filter(|v| !v.trim().is_empty()).or(old)
 }
 
 /// The address every cloud request is built on, decided once per process.
 pub fn base_url() -> Result<&'static str> {
     static BASE: OnceLock<std::result::Result<String, String>> = OnceLock::new();
     BASE.get_or_init(|| {
-        let configured = std::env::var("NEXUS_CLOUD_URL").ok();
-        let allow_plaintext = std::env::var("NEXUS_CLOUD_ALLOW_PLAINTEXT").ok().as_deref() == Some("lab-only");
+        let configured = setting("URL");
+        let allow_plaintext = setting("ALLOW_PLAINTEXT").as_deref() == Some("lab-only");
         resolve_base_url(configured.as_deref(), allow_plaintext, super::agent::DEFAULT_BASE_URL)
             .map_err(|e| e.to_string())
     })
@@ -84,19 +99,19 @@ pub fn base_url() -> Result<&'static str> {
 
 // ---------- HTTP clients ----------
 
-/// Certificates from `NEXUS_CLOUD_CA_FILE`, if that is set.
+/// Certificates from `INDAGATE_SERVER_CA_FILE`, if that is set.
 fn extra_roots(path: Option<&str>) -> Result<Vec<Certificate>> {
     let Some(path) = path.map(str::trim).filter(|p| !p.is_empty()) else {
         return Ok(Vec::new());
     };
-    let size = std::fs::metadata(path).with_context(|| format!("read NEXUS_CLOUD_CA_FILE {path}"))?.len();
+    let size = std::fs::metadata(path).with_context(|| format!("read INDAGATE_SERVER_CA_FILE {path}"))?.len();
     if size > MAX_CA_FILE_BYTES {
-        return Err(anyhow!("NEXUS_CLOUD_CA_FILE is too large"));
+        return Err(anyhow!("INDAGATE_SERVER_CA_FILE is too large"));
     }
-    let pem = std::fs::read(path).with_context(|| format!("read NEXUS_CLOUD_CA_FILE {path}"))?;
-    let certificates = Certificate::from_pem_bundle(&pem).context("parse NEXUS_CLOUD_CA_FILE")?;
+    let pem = std::fs::read(path).with_context(|| format!("read INDAGATE_SERVER_CA_FILE {path}"))?;
+    let certificates = Certificate::from_pem_bundle(&pem).context("parse INDAGATE_SERVER_CA_FILE")?;
     if certificates.is_empty() {
-        return Err(anyhow!("NEXUS_CLOUD_CA_FILE contains no certificates"));
+        return Err(anyhow!("INDAGATE_SERVER_CA_FILE contains no certificates"));
     }
     Ok(certificates)
 }
@@ -106,7 +121,7 @@ fn builder() -> Result<reqwest::ClientBuilder> {
         .connect_timeout(REQUEST_TIMEOUT)
         .tcp_keepalive(Duration::from_secs(30))
         .pool_idle_timeout(Duration::from_secs(60));
-    for certificate in extra_roots(std::env::var("NEXUS_CLOUD_CA_FILE").ok().as_deref())? {
+    for certificate in extra_roots(setting("CA_FILE").as_deref())? {
         builder = builder.add_root_certificate(certificate);
     }
     Ok(builder)
@@ -194,7 +209,9 @@ enum StreamEnd {
 async fn stream_once(device_id: &str, device_secret: &str, nudges: &mpsc::Sender<Nudge>) -> Result<StreamEnd> {
     let mut response = stream_client()?
         .get(format!("{}/v1/stream", base_url()?))
+        .header("x-indagate-device-id", device_id)
         .header("x-nexus-device-id", device_id)
+        .header("x-indagate-device-secret", device_secret)
         .header("x-nexus-device-secret", device_secret)
         .send()
         .await
@@ -223,10 +240,10 @@ async fn stream_once(device_id: &str, device_secret: &str, nudges: &mpsc::Sender
     Ok(StreamEnd::Closed)
 }
 
-/// Whether the push stream should be used at all (`NEXUS_CLOUD_PUSH=off` disables it).
+/// Whether the push stream should be used at all (`INDAGATE_SERVER_PUSH=off` disables it).
 pub fn push_enabled() -> bool {
     !matches!(
-        std::env::var("NEXUS_CLOUD_PUSH").ok().as_deref().map(str::trim),
+        setting("PUSH").as_deref().map(str::trim),
         Some("off" | "0" | "false" | "disabled")
     )
 }
@@ -269,6 +286,17 @@ mod tests {
     use super::*;
 
     const BUILT_IN: &str = "https://built-in.example/functions/v1/nexus-device";
+
+    #[test]
+    fn the_new_setting_name_wins_and_the_old_one_still_works() {
+        let s = |v: &str| Some(v.to_string());
+        assert_eq!(pick_setting(s("new"), s("old")), s("new"));
+        assert_eq!(pick_setting(None, s("old")), s("old"));
+        assert_eq!(pick_setting(None, None), None);
+        // An empty new value counts as not set; a malformed one is reported, not replaced.
+        assert_eq!(pick_setting(s(" "), s("https://old.example")), s("https://old.example"));
+        assert!(resolve_base_url(pick_setting(s("not a url"), s("https://old.example")).as_deref(), false, BUILT_IN).is_err());
+    }
 
     #[test]
     fn unset_address_uses_the_built_in_one() {
