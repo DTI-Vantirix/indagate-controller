@@ -44,6 +44,78 @@ pub(crate) fn evaluate_at(
     channel: u8,
     now: DateTime<Utc>,
 ) -> Result<DecisionResult> {
+    let card = Card { format: DEFAULT_CARD_FORMAT, facility_code: Some(u64::from(facility_code)), card_code: u64::from(card_code) };
+    let decided = evaluate_card_at(conn, &card, channel, now)?;
+    Ok(DecisionResult {
+        decision: decided.decision,
+        reason: decided.reason,
+        facility_code,
+        card_code,
+        channel,
+        credential_id: decided.credential_id,
+        holder_name: decided.holder_name,
+    })
+}
+
+/// The layout every card had before layouts were recorded: 26 bits, an 8-bit facility
+/// code and a 16-bit card number.
+pub const DEFAULT_CARD_FORMAT: &str = "h10301-26";
+
+/// A card as one layout reads it. The same bits can mean different cards under different
+/// layouts, so a credential is matched on the layout as well as the numbers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Card<'a> {
+    /// Layout identifier, e.g. `h10301-26`.
+    pub format: &'a str,
+    /// Absent for layouts that have no facility code.
+    pub facility_code: Option<u64>,
+    pub card_code: u64,
+}
+
+/// The decision for a card of any layout.
+#[derive(Debug, Clone)]
+pub struct CardDecision {
+    pub decision: AccessDecision,
+    pub reason: String,
+    pub credential_id: Option<String>,
+    pub holder_name: Option<String>,
+}
+
+impl CardDecision {
+    fn deny(reason: &str, credential_id: Option<String>, holder_name: Option<String>) -> Self {
+        Self { decision: AccessDecision::Deny, reason: reason.to_string(), credential_id, holder_name }
+    }
+}
+
+/// Decide whether `card` may open the door on reader port `channel` now.
+pub fn evaluate_card(conn: &Connection, card: &Card<'_>, channel: u8) -> Result<CardDecision> {
+    evaluate_card_at(conn, card, channel, Utc::now())
+}
+
+/// Whether a credential exists for `card` at all, whatever its state.
+pub fn card_is_known(conn: &Connection, card: &Card<'_>) -> Result<bool> {
+    Ok(conn
+        .query_row(
+            "SELECT 1 FROM credentials WHERE format = ?1 AND facility_code = ?2 AND card_code = ?3",
+            params![card.format, stored_facility(card), i64::try_from(card.card_code)?],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
+}
+
+/// A layout with no facility code is stored with facility 0; the layout keeps it apart
+/// from any card that really has facility 0.
+fn stored_facility(card: &Card<'_>) -> i64 {
+    card.facility_code.and_then(|f| i64::try_from(f).ok()).unwrap_or(0)
+}
+
+pub(crate) fn evaluate_card_at(
+    conn: &Connection,
+    card: &Card<'_>,
+    channel: u8,
+    now: DateTime<Utc>,
+) -> Result<CardDecision> {
     // SA16Q READER POLICY V1: port is assigned by the pinned GPIO profile, not
     // by card data. No database reader mapping => deny, never legacy allow.
     let reader_policy = conn.query_row(
@@ -58,11 +130,7 @@ pub(crate) fn evaluate_at(
         _ => Some("reader_door_mapping_invalid"),
     };
     if let Some(reason) = reader_denial {
-        return Ok(DecisionResult {
-            decision: AccessDecision::Deny, reason: reason.to_string(),
-            facility_code, card_code, channel,
-            credential_id: None, holder_name: None,
-        });
+        return Ok(CardDecision::deny(reason, None, None));
     }
 
     let door_enabled = conn
@@ -79,28 +147,8 @@ pub(crate) fn evaluate_at(
 
     match door_enabled {
         Some(1) => {}
-        Some(_) => {
-            return Ok(DecisionResult {
-                decision: AccessDecision::Deny,
-                reason: "door_disabled".to_string(),
-                facility_code,
-                card_code,
-                channel,
-                credential_id: None,
-                holder_name: None,
-            });
-        }
-        None => {
-            return Ok(DecisionResult {
-                decision: AccessDecision::Deny,
-                reason: "door_not_configured".to_string(),
-                facility_code,
-                card_code,
-                channel,
-                credential_id: None,
-                holder_name: None,
-            });
-        }
+        Some(_) => return Ok(CardDecision::deny("door_disabled", None, None)),
+        None => return Ok(CardDecision::deny("door_not_configured", None, None)),
     }
     let credential = conn
         .query_row(
@@ -112,10 +160,11 @@ pub(crate) fn evaluate_at(
                 valid_from,
                 valid_until
             FROM credentials
-            WHERE facility_code = ?1
-              AND card_code = ?2
+            WHERE format = ?1
+              AND facility_code = ?2
+              AND card_code = ?3
             "#,
-            params![facility_code, card_code],
+            params![card.format, stored_facility(card), i64::try_from(card.card_code)?],
             |row| {
                 Ok((
                     row.get::<_, String>(0)?,
@@ -129,54 +178,22 @@ pub(crate) fn evaluate_at(
         .optional()?;
 
     let Some((credential_id, enabled, holder_name, valid_from, valid_until)) = credential else {
-        return Ok(DecisionResult {
-            decision: AccessDecision::Deny,
-            reason: "credential_not_found".to_string(),
-            facility_code,
-            card_code,
-            channel,
-            credential_id: None,
-            holder_name: None,
-        });
+        return Ok(CardDecision::deny("credential_not_found", None, None));
     };
 
     if enabled == 0 {
-        return Ok(DecisionResult {
-            decision: AccessDecision::Deny,
-            reason: "credential_disabled".to_string(),
-            facility_code,
-            card_code,
-            channel,
-            credential_id: Some(credential_id),
-            holder_name,
-        });
+        return Ok(CardDecision::deny("credential_disabled", Some(credential_id), holder_name));
     }
 
     if let Some(valid_from) = valid_from {
         if now < parse_datetime(&valid_from)? {
-            return Ok(DecisionResult {
-                decision: AccessDecision::Deny,
-                reason: "credential_not_yet_valid".to_string(),
-                facility_code,
-                card_code,
-                channel,
-                credential_id: Some(credential_id),
-                holder_name,
-            });
+            return Ok(CardDecision::deny("credential_not_yet_valid", Some(credential_id), holder_name));
         }
     }
 
     if let Some(valid_until) = valid_until {
         if now >= parse_datetime(&valid_until)? {
-            return Ok(DecisionResult {
-                decision: AccessDecision::Deny,
-                reason: "credential_expired".to_string(),
-                facility_code,
-                card_code,
-                channel,
-                credential_id: Some(credential_id),
-                holder_name,
-            });
+            return Ok(CardDecision::deny("credential_expired", Some(credential_id), holder_name));
         }
     }
 
@@ -232,51 +249,21 @@ pub(crate) fn evaluate_at(
     }
 
     if !found_door_permission {
-        return Ok(DecisionResult {
-            decision: AccessDecision::Deny,
-            reason: "door_not_allowed".to_string(),
-            facility_code,
-            card_code,
-            channel,
-            credential_id: Some(credential_id),
-            holder_name,
-        });
+        return Ok(CardDecision::deny("door_not_allowed", Some(credential_id), holder_name));
     }
 
     if unsafe_unscheduled_path || found_holiday_denial {
-        return Ok(DecisionResult {
-            decision: AccessDecision::Deny,
-            reason: if unsafe_unscheduled_path {
-                "schedule_missing_for_holiday"
-            } else {
-                "holiday_denied"
-            }.to_string(),
-            facility_code,
-            card_code,
-            channel,
-            credential_id: Some(credential_id),
-            holder_name,
-        });
+        let reason = if unsafe_unscheduled_path { "schedule_missing_for_holiday" } else { "holiday_denied" };
+        return Ok(CardDecision::deny(reason, Some(credential_id), holder_name));
     }
 
     if !found_active_schedule {
-        return Ok(DecisionResult {
-            decision: AccessDecision::Deny,
-            reason: "schedule_inactive".to_string(),
-            facility_code,
-            card_code,
-            channel,
-            credential_id: Some(credential_id),
-            holder_name,
-        });
+        return Ok(CardDecision::deny("schedule_inactive", Some(credential_id), holder_name));
     }
 
-    Ok(DecisionResult {
+    Ok(CardDecision {
         decision: AccessDecision::Grant,
         reason: "access_granted".to_string(),
-        facility_code,
-        card_code,
-        channel,
         credential_id: Some(credential_id),
         holder_name,
     })
