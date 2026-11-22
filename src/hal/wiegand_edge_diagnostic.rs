@@ -187,7 +187,7 @@ fn report(
             overflow: frame.overflow,
         });
     }
-    // HLAXS 0.4: separate bounded channel into IN-PROCESS Rust worker.
+    // Indagate Access 0.4: separate bounded channel into IN-PROCESS Rust worker.
     // No network/crypto work on the GPIO timing-sensitive thread.
     if let Some(tx) = shadow_sender {
         let _ = tx.try_send(super::credential_capture::CaptureFrame {
@@ -199,7 +199,7 @@ fn report(
     let candidates = super::credential_formats::identify(&frame.bits, frame.overflow);
     // Candidate interpretation is diagnostic information, never an authorization override.
     for candidate in &candidates {
-        info!(target: "hlaxs_format_identifier", reader=reader+1,
+        info!(target: "indagate_format_identifier", reader=reader+1,
             format_id=candidate.format_id, frame_bits=candidate.frame_bits,
             facility_code=?candidate.facility_code, card_code=?candidate.card_code,
             parity=candidate.parity, authorization_eligible=candidate.authorization_eligible,
@@ -231,14 +231,14 @@ fn report(
                     .map_err(|e| e.to_string())
                 });
                 match outcome {
-                    Ok(decision) => info!(target: "hlaxs_shadow_auth", reader=reader+1,
+                    Ok(decision) => info!(target: "indagate_shadow_auth", reader=reader+1,
                         decision=?decision.decision, reason=%decision.reason,
                         "SHADOW ONLY: no relay actuation or access queue mutation"),
-                    Err(error) => tracing::warn!(target: "hlaxs_shadow_auth", reader=reader+1,
+                    Err(error) => tracing::warn!(target: "indagate_shadow_auth", reader=reader+1,
                         error=%error, "SHADOW UNAVAILABLE: no relay actuation"),
                 }
             }
-            None => info!(target: "hlaxs_shadow_auth", reader=reader+1,
+            None => info!(target: "indagate_shadow_auth", reader=reader+1,
                 "SHADOW REJECT: invalid/unsupported/overflowed frame; no relay actuation"),
         }
     }
@@ -254,7 +254,7 @@ fn report(
     let min_gap_us = frame.min_gap_us.unwrap_or(0);
     let max_gap_us = frame.max_gap_us.unwrap_or(0);
     if let Some((fc, card, parity)) = parity_26(&frame.bits) {
-        info!(target: "hlaxs_edge_diag", reader=reader+1, count=frame.bits.len(), raw_bits=%raw,
+        info!(target: "indagate_edge_diag", reader=reader+1, count=frame.bits.len(), raw_bits=%raw,
             facility_code=fc, card_code=card, parity_valid=parity,
             overflow=frame.overflow, duration_us=frame.duration_us,
             min_observed_gap_us=min_gap_us, max_observed_gap_us=max_gap_us,
@@ -263,7 +263,7 @@ fn report(
             total_frames=stats.total, total_overflows=stats.overflow,
             "DIAGNOSTIC ONLY: no access decision / no relay actuation");
     } else {
-        info!(target: "hlaxs_edge_diag", reader=reader+1, count=frame.bits.len(), raw_bits=%raw,
+        info!(target: "indagate_edge_diag", reader=reader+1, count=frame.bits.len(), raw_bits=%raw,
             overflow=frame.overflow, duration_us=frame.duration_us,
             min_observed_gap_us=min_gap_us, max_observed_gap_us=max_gap_us,
             max_rearm_us=frame.max_rearm_us, repeated, valid_26=stats.valid_26,
@@ -287,7 +287,7 @@ pub fn run(profile: &BoardProfile) -> Result<(), String> {
     let mut stats: Vec<ReaderStats> = (0..profile.readers.len())
         .map(|_| ReaderStats::default())
         .collect();
-    info!(target: "hlaxs_edge_diag", inputs=lines.len(),
+    info!(target: "indagate_edge_diag", inputs=lines.len(),
           "STARTED sysfs edge diagnostic: relay commands disabled in this path");
     loop {
         let mut fds: Vec<libc::pollfd> = lines

@@ -1,4 +1,4 @@
-//! Strictly local-only HLAXS.Access policy hardening and MOCK audit receipts.
+//! Strictly local-only Indagate Access policy hardening and MOCK audit receipts.
 //! Not registered by controller main/cloud agent. Contains NO GPIO, relays,
 //! command delivery, network clients, physical actuator traits or cloud ACK.
 use anyhow::{anyhow, ensure, Result};

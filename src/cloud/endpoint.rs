@@ -210,7 +210,7 @@ async fn stream_once(device_id: &str, device_secret: &str, nudges: &mpsc::Sender
     while let Some(chunk) = response.chunk().await.context("read push stream")? {
         for signal in parser.push(&chunk)? {
             match signal {
-                Signal::Ready => info!(target: "nexus_cloud", "Push stream connected"),
+                Signal::Ready => info!(target: "indagate_cloud", "Push stream connected"),
                 Signal::Nudge(nudge) => match nudges.try_send(nudge) {
                     Ok(()) => {}
                     // The loop already has nudges waiting; one more would tell it nothing new.
@@ -243,15 +243,15 @@ pub async fn run_stream(device_id: String, device_secret: String, nudges: mpsc::
                 delay
             }
             Ok(StreamEnd::Unsupported) => {
-                info!(target: "nexus_cloud", "Cloud has no push stream; using timed polling only");
+                info!(target: "indagate_cloud", "Cloud has no push stream; using timed polling only");
                 Duration::from_secs(300)
             }
             Ok(StreamEnd::Refused(status)) => {
-                warn!(target: "nexus_cloud", status = %status, "Push stream refused; using timed polling");
+                warn!(target: "indagate_cloud", status = %status, "Push stream refused; using timed polling");
                 Duration::from_secs(60)
             }
             Err(e) => {
-                warn!(target: "nexus_cloud", error = %e, "Push stream unavailable; using timed polling");
+                warn!(target: "indagate_cloud", error = %e, "Push stream unavailable; using timed polling");
                 let wait = delay;
                 delay = (delay * 2).min(Duration::from_secs(60));
                 wait

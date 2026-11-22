@@ -7,11 +7,11 @@ use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::hal::relay_worker::RelayCommand;
-use crate::storage::NexusDatabase;
+use crate::storage::ControllerDatabase;
 
 use super::schedule;
 
-fn queue_event(db: &NexusDatabase, event_type: &str, channel: u8, payload: serde_json::Value) {
+fn queue_event(db: &ControllerDatabase, event_type: &str, channel: u8, payload: serde_json::Value) {
     let result = db.connection().execute(
         r#"
         INSERT INTO event_queue
@@ -42,7 +42,7 @@ fn queue_event(db: &NexusDatabase, event_type: &str, channel: u8, payload: serde
     }
 }
 
-fn desired_state(db: &NexusDatabase, channel: u8) -> Result<bool, anyhow::Error> {
+fn desired_state(db: &ControllerDatabase, channel: u8) -> Result<bool, anyhow::Error> {
     use rusqlite::OptionalExtension;
 
     let schedule_id = db
@@ -68,7 +68,7 @@ fn desired_state(db: &NexusDatabase, channel: u8) -> Result<bool, anyhow::Error>
 }
 
 pub async fn run(db_path: &str, relay_tx: mpsc::Sender<RelayCommand>) {
-    let db = match NexusDatabase::open(db_path) {
+    let db = match ControllerDatabase::open(db_path) {
         Ok(db) => db,
 
         Err(e) => {
@@ -129,7 +129,7 @@ pub async fn run(db_path: &str, relay_tx: mpsc::Sender<RelayCommand>) {
                     };
 
                     info!(
-                        target: "nexus_schedule",
+                        target: "indagate_schedule",
                         channel = channel,
                         door = channel + 1,
                         relay_held = desired,

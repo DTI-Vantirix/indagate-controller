@@ -1,4 +1,4 @@
-//! HLAXS.Access Stage 3F-A: offline, NON-ACTUATING signing contract verifier.
+//! Indagate Access Stage 3F-A: offline, NON-ACTUATING signing contract verifier.
 //! Never deployed as the live controller, never requests cloud config, never ACKs,
 //! never writes durable trust state, never drives a door, never returns ALLOW.
 //! Caller-provided --as-of is an UNTRUSTED SIMULATION CLOCK, not trusted time.
@@ -6,7 +6,8 @@ use anyhow::{anyhow, bail, ensure, Context, Result};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use ring::{digest, signature::{UnparsedPublicKey, ED25519}};
 use serde_json::Value;
-use std::{collections::HashSet, env, fs};
+use std::{collections::HashSet, env, fs, path::{Path, PathBuf}, os::unix::fs::{DirBuilderExt,MetadataExt,OpenOptionsExt,PermissionsExt}, fs::OpenOptions};
+use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 
 const MAX_FILE: usize = 200_000;
 const MAX_PAYLOAD: usize = 160_000;
@@ -18,6 +19,11 @@ const SUBJECT: &str = "e0d7746e-8dd5-4a3d-abdd-ba1404a0fd8b";
 const LEVEL: &str = "2fb75404-53b2-4d89-9d14-4733f90105fd";
 const SCHEDULE: &str = "15009b2d-1b2a-44fb-8bb6-7f79be6d16cd";
 const DOMAIN: &str = "hlaxs-access-production";
+const CHECKPOINT_SCHEMA: &str = "hlaxs040_stage3fb_detached_checkpoint_v1";
+const CHECKPOINT_FILE: &str = "trust-checkpoint.sqlite";
+#[derive(Debug, Clone)]
+struct Verified {epoch:u64,version:u64,checksum:String,keyring_digest:String}
+
 
 fn sha_hex(bytes: &[u8]) -> String {
     digest::digest(&digest::SHA256, bytes).as_ref().iter().map(|x|format!("{x:02x}")).collect()
@@ -123,7 +129,7 @@ fn array<'a>(v:&'a Value,k:&str,n:usize) -> Result<&'a Vec<Value>> {
 struct Params {
     as_of:DateTime<Utc>,min_epoch:u64,root_id:String,
 }
-fn verify_chain(root_pem:&[u8],ring_envelope:&[u8],policy_envelope:&[u8],p:&Params) -> Result<()> {
+fn verify_chain(root_pem:&[u8],ring_envelope:&[u8],policy_envelope:&[u8],p:&Params) -> Result<Verified> {
     let root=root_spki(root_pem)?;
     ensure!(!p.root_id.is_empty() && p.min_epoch>0,"missing_trust_anchor_metadata");
     let keyring=envelope(ring_envelope,&p.root_id,&root)?;
@@ -201,7 +207,8 @@ fn verify_chain(root_pem:&[u8],ring_envelope:&[u8],policy_envelope:&[u8],p:&Para
     println!("OUTPUT_AUTHORITY=FALSE");
     println!("FINAL_AUTHORIZATION=DENY_UNTRUSTED_EVIDENCE");
     println!("STAGE3F_OFFLINE_SIGNATURE_CONTRACT=PASS");
-    Ok(())
+    Ok(Verified{epoch:number(&keyring,"epoch")?,version:number(&policy,"config_version")?,
+       checksum:string(&policy,"config_checksum")?.to_string(),keyring_digest:sha_hex(ring_envelope)})
 }
 fn validate_bench_config(v:&Value)->Result<()> {
     exact_fields(v,&["credentials","credential_access_levels","access_levels",
@@ -243,25 +250,193 @@ fn validate_bench_config(v:&Value)->Result<()> {
     ensure!(schedules[0].get("definition")==Some(&serde_json::json!({"always":true})),"not_24x7");
     Ok(())
 }
-fn run()->Result<()> {
-    let args:Vec<String>=env::args().collect();
-    if args.len()!=13 || args[1]!="--root-pem" ||args[3]!="--root-key-id"||
-        args[5]!="--keyring"||args[7]!="--policy"||args[9]!="--as-of"||args[11]!="--min-epoch" {
-        bail!("Usage: hlaxs040_stage3f_trust_audit --root-pem ROOT.pem --root-key-id ID --keyring keyring.json --policy policy.json --as-of 2026-10-27T18:15:00Z --min-epoch N");
-    }
-    let at=DateTime::parse_from_rfc3339(&args[10])?.with_timezone(&Utc);
-    ensure!(args[10].ends_with('Z'),"simulation_clock_requires_utc");
-    let param=Params {as_of:at,min_epoch:args[12].parse()?,root_id:args[4].clone()};
-    for file in [&args[2],&args[6],&args[8]] {
-        let meta=fs::symlink_metadata(file)?;
-        ensure!(meta.file_type().is_file()&&meta.len()<=MAX_FILE as u64,"unsafe_file_type_or_size");
-    }
-    let root=fs::read(&args[2]).context("root_public_key_unavailable")?;
-    let ring=fs::read(&args[6]).context("signed_keyring_unavailable")?;
-    let policy=fs::read(&args[8]).context("signed_policy_unavailable")?;
-    verify_chain(&root,&ring,&policy,&param)
+// SQLite is a locally durable monotonic checkpoint, NOT a hardware rollback counter.
+// A privileged disk adversary could replace the whole DB with an earlier valid copy.
+#[derive(Debug, Clone)]
+struct State {root_id:String,root_sha:String,epoch:u64,config_version:u64,config_checksum:String,
+    ring_sha:String,generation:u64,integrity:String}
+fn seal(s:&State)->String {
+  // Fixed ordered tuple with explicit domain separation, no ambiguity from join delimiters.
+  let fields=serde_json::json!([CHECKPOINT_SCHEMA,s.root_id,s.root_sha,s.epoch,
+     s.config_version,s.config_checksum,s.ring_sha,s.generation]);
+  sha_hex(serde_json::to_string(&fields).expect("serializable_checkpoint").as_bytes())
 }
-fn main(){if let Err(e)=run(){eprintln!("STAGE3F_OFFLINE_SIGNATURE_CONTRACT=FAIL");eprintln!("ERROR={e:#}");std::process::exit(1)}}
+fn check_state(s:&State)->Result<()> {
+  ensure!(s.epoch>=1 && s.generation>=1 &&
+     s.root_id.len()>0 && s.root_id.len()<=96 &&
+     s.root_sha.len()==64 && s.root_sha.chars().all(|c|c.is_ascii_hexdigit()) &&
+     (s.config_version==0 || s.config_checksum.len()==64) &&
+     (s.config_version==0 || s.ring_sha.len()==64) &&
+     s.integrity==seal(s),"CHECKPOINT_INTEGRITY_FAILURE");
+  Ok(())
+}
+fn check_owner_private(path:&Path,is_dir:bool)->Result<()> {
+  let link=fs::symlink_metadata(path).with_context(||format!("STATE_PATH_UNAVAILABLE {}",path.display()))?;
+  ensure!(!link.file_type().is_symlink(),"STATE_SYMLINK_REJECTED");
+  ensure!(if is_dir {link.is_dir()} else {link.is_file() && link.nlink()==1},"STATE_TYPE_REJECTED");
+  ensure!(link.uid()==unsafe {libc::geteuid()},"STATE_OWNER_REJECTED");
+  let mask=if is_dir {0o700} else {0o600};
+  ensure!(link.permissions().mode()&0o777==mask,"STATE_PERMISSIONS_REJECTED");
+  Ok(())
+}
+fn prepare_dir(path:&Path,create:bool)->Result<()> {
+  if create && !path.exists() {
+    // Unix mkdir honors specified restrictive permissions under any normal umask.
+    fs::DirBuilder::new().mode(0o700).create(path).context("STATE_MKDIR_FAILED")?;
+    let parent=path.parent().ok_or_else(||anyhow!("STATE_PARENT_REQUIRED"))?;
+    fs::File::open(parent)?.sync_all().context("STATE_DIRECTORY_FSYNC_FAILED")?;
+  }
+  check_owner_private(path,true)
+}
+fn database(path:&Path,create:bool)->Result<Connection> {
+  prepare_dir(path,create)?;
+  let db_path=path.join(CHECKPOINT_FILE);
+  if !db_path.exists() {
+    ensure!(create,"STATE_NOT_INITIALIZED");
+    let f=OpenOptions::new().read(true).write(true).create_new(true).mode(0o600)
+       .open(&db_path).context("STATE_SECURE_CREATE_FAILED")?;
+    f.sync_all()?;
+    fs::File::open(path)?.sync_all()?;
+  }
+  check_owner_private(&db_path,false)?;
+  let db=Connection::open(&db_path)?;
+  db.execute_batch("PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL; PRAGMA busy_timeout=2000;")?;
+  db.execute_batch("CREATE TABLE IF NOT EXISTS checkpoint(
+    singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+    schema_name TEXT NOT NULL, root_id TEXT NOT NULL, root_sha TEXT NOT NULL,
+    epoch INTEGER NOT NULL, config_version INTEGER NOT NULL,
+    config_checksum TEXT NOT NULL, ring_sha TEXT NOT NULL,
+    generation INTEGER NOT NULL, integrity TEXT NOT NULL);")?;
+  check_owner_private(&db_path,false)?;
+  Ok(db)
+}
+fn read_state(tx:&Transaction<'_>)->Result<Option<State>> {
+  let s:Option<State>=tx.query_row("SELECT root_id,root_sha,epoch,config_version,config_checksum,ring_sha,generation,integrity
+       FROM checkpoint WHERE singleton=1 AND schema_name=?1",[CHECKPOINT_SCHEMA],|r|{
+     Ok(State{root_id:r.get(0)?,root_sha:r.get(1)?,epoch:r.get(2)?,
+        config_version:r.get(3)?,config_checksum:r.get(4)?,ring_sha:r.get(5)?,
+        generation:r.get(6)?,integrity:r.get(7)?})
+  }).optional()?;
+  // Reject unknown schema or duplicate rows; never interpret an empty lookup as first boot.
+  let rows:i64=tx.query_row("SELECT COUNT(*) FROM checkpoint",[],|r|r.get(0))?;
+  ensure!(rows<=1 && (rows==1)==s.is_some(),"CHECKPOINT_SCHEMA_OR_ROW_INVALID");
+  if let Some(ref state)=s {check_state(state)?;}
+  Ok(s)
+}
+fn store_state(tx:&Transaction<'_>,s:&State)->Result<()> {
+  check_state(s)?;
+  tx.execute("INSERT INTO checkpoint(singleton,schema_name,root_id,root_sha,epoch,config_version,config_checksum,ring_sha,generation,integrity)
+     VALUES(1,?1,?2,?3,?4,?5,?6,?7,?8,?9)
+     ON CONFLICT(singleton) DO UPDATE SET schema_name=excluded.schema_name,
+     root_id=excluded.root_id,root_sha=excluded.root_sha,epoch=excluded.epoch,
+     config_version=excluded.config_version,config_checksum=excluded.config_checksum,
+     ring_sha=excluded.ring_sha,generation=excluded.generation,integrity=excluded.integrity",
+   params![CHECKPOINT_SCHEMA,s.root_id,s.root_sha,s.epoch,s.config_version,
+        s.config_checksum,s.ring_sha,s.generation,s.integrity])?;
+  Ok(())
+}
+fn read_regular(path:&Path,label:&str)->Result<Vec<u8>> {
+  let meta=fs::symlink_metadata(path)?;
+  ensure!(meta.is_file() && !meta.file_type().is_symlink() && meta.len()<=MAX_FILE as u64,
+       "INPUT_UNSAFE_{label}");
+  fs::read(path).with_context(||format!("INPUT_READ_ERROR_{label}"))
+}
+fn run()->Result<()> {
+  let args:Vec<String>=env::args().collect();
+  if args.len()==8 && args[1]=="--pin-test-root" && args[2]=="--state-dir" &&
+     args[4]=="--root-pem" && args[6]=="--root-key-id" {
+    let state_dir=PathBuf::from(&args[3]);
+    ensure!(state_dir.is_absolute(),"STATE_DIR_MUST_BE_ABSOLUTE");
+    let root=read_regular(Path::new(&args[5]),"ROOT")?;
+    let _=root_spki(&root)?;
+    let root_id=&args[7];
+    ensure!(!root_id.is_empty()&&root_id.len()<=96,"INVALID_ROOT_ID");
+    let mut conn=database(&state_dir,true)?;
+    let tx=conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    ensure!(read_state(&tx)?.is_none(),"ROOT_ALREADY_PINNED");
+    let mut state=State{root_id:root_id.clone(),root_sha:sha_hex(&root),epoch:1,
+        config_version:0,config_checksum:String::new(),ring_sha:String::new(),
+        generation:1,integrity:String::new()};
+    state.integrity=seal(&state);
+    store_state(&tx,&state)?;
+    tx.commit()?;
+    println!("STAGE3FB_TEST_ROOT_PINNED=PASS");
+    println!("TRUST_ANCHOR_PROVISIONED_FOR_PRODUCTION=NO");
+    println!("LOCAL_CHECKPOINT_ONLY=TRUE");
+    println!("LIVE_CONTROLLER_CHANGED=NO");
+    return Ok(())
+  }
+  if args.len()==4 && args[1]=="--inspect" && args[2]=="--state-dir" {
+    let dir=PathBuf::from(&args[3]);
+    ensure!(dir.is_absolute(),"STATE_DIR_MUST_BE_ABSOLUTE");
+    let mut conn=database(&dir,false)?;
+    let tx=conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let state=read_state(&tx)?.ok_or_else(||anyhow!("STATE_NOT_PINNED"))?;
+    println!("STAGE3FB_CHECKPOINT_INTEGRITY=PASS");
+    println!("STATE_KEYRING_EPOCH={}",state.epoch);
+    println!("STATE_CONFIG_VERSION={}",state.config_version);
+    println!("STATE_GENERATION={}",state.generation);
+    println!("ROOT_PIN=LOCAL_SIMULATION_ONLY");
+    println!("HARDWARE_ROLLBACK_RESISTANCE=NOT_ESTABLISHED");
+    println!("CONTROLLER_OUTPUT_AUTHORITY=FALSE");
+    tx.commit()?;
+    return Ok(())
+  }
+  if args.len()!=17 || args[1]!="--verify-and-commit" || args[2]!="--state-dir" ||
+      args[4]!="--root-pem" || args[6]!="--root-key-id" || args[8]!="--keyring" ||
+      args[10]!="--policy" || args[12]!="--as-of" || args[14]!="--min-epoch" ||
+      args[16]!="--nonactuating-only" {
+    bail!("Usage: --pin-test-root --state-dir ABS --root-pem PUB.pem --root-key-id ID | --inspect --state-dir ABS | --verify-and-commit --state-dir ABS --root-pem PUB.pem --root-key-id ID --keyring signed-keyring.json --policy signed-policy.json --as-of UTC --min-epoch N --nonactuating-only");
+  }
+  let dir=PathBuf::from(&args[3]);
+  ensure!(dir.is_absolute(),"STATE_DIR_MUST_BE_ABSOLUTE");
+  let root=read_regular(Path::new(&args[5]),"ROOT")?;
+  let keyring=read_regular(Path::new(&args[9]),"KEYRING")?;
+  let policy=read_regular(Path::new(&args[11]),"POLICY")?;
+  let root_hash=sha_hex(&root);
+  let at=DateTime::parse_from_rfc3339(&args[13])?.with_timezone(&Utc);
+  ensure!(args[13].ends_with('Z'),"SIMULATED_CLOCK_MUST_BE_UTC");
+  let cli_epoch:u64=args[15].parse()?;
+  ensure!(cli_epoch>0,"INVALID_MIN_EPOCH");
+  let mut conn=database(&dir,false)?;
+  let tx=conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+  let mut existing=read_state(&tx)?.ok_or_else(||anyhow!("ROOT_NOT_PINNED"))?;
+  ensure!(existing.root_id==args[7]&&existing.root_sha==root_hash,
+    "PINNED_ROOT_MISMATCH");
+  let p=Params{as_of:at,min_epoch:cli_epoch.max(existing.epoch),root_id:args[7].clone()};
+  let verified=verify_chain(&root,&keyring,&policy,&p)?;
+  ensure!(verified.epoch>=existing.epoch && verified.version>=existing.config_version,
+    "DURABLE_VERSION_ROLLBACK");
+  if verified.epoch==existing.epoch && existing.config_version>0 {
+    ensure!(verified.keyring_digest==existing.ring_sha,"SAME_EPOCH_KEYRING_REPLACEMENT");
+  }
+  if verified.version==existing.config_version && existing.config_version>0 {
+    ensure!(verified.checksum==existing.config_checksum,"SAME_VERSION_CONFIG_MUTATION");
+  }
+  let changed=verified.epoch>existing.epoch || verified.version>existing.config_version ||
+     existing.config_version==0;
+  if changed {
+    existing.epoch=verified.epoch;existing.config_version=verified.version;
+    existing.config_checksum=verified.checksum;
+    existing.ring_sha=verified.keyring_digest;
+    existing.generation=existing.generation.checked_add(1).ok_or_else(||anyhow!("GENERATION_OVERFLOW"))?;
+    existing.integrity=seal(&existing);
+    store_state(&tx,&existing)?;
+  }
+  tx.commit()?;
+  println!("STAGE3FB_CRYPTO_VERIFICATION_AND_COMMIT=PASS");
+  println!("STAGE3FB_DURABLE_EPOCH={}",existing.epoch);
+  println!("STAGE3FB_DURABLE_CONFIG_VERSION={}",existing.config_version);
+  println!("STAGE3FB_REPLAY={}",if changed {"NEW_CHECKPOINT"}else{"IDEMPOTENT"});
+  println!("HARDWARE_ROLLBACK_RESISTANCE=NOT_ESTABLISHED");
+  println!("TRUSTED_TIME=SIMULATED_NOT_PRODUCTION");
+  println!("ROOT_KEY_CUSTODY=TEST_FIXTURE_ONLY");
+  println!("CONTROLLER_OUTPUT_AUTHORITY=FALSE");
+  println!("PRODUCTION_APPLIED_ACK_SENT=NO");
+  println!("CLOUD_WRITES=NONE");
+  Ok(())
+}
+fn main(){if let Err(e)=run(){eprintln!("STAGE3FB_DETACHED_TRUST_CHECKPOINT=FAIL");eprintln!("ERROR={e:#}");std::process::exit(1)}}
 
 #[cfg(test)]
 mod tests {
@@ -355,4 +530,20 @@ mod tests {
         assert!(verify_chain(&r,&k,&wrong,&p).is_err());
     }
     #[test]fn reject_non_base64_key(){assert!(raw_key("!").is_err());}
+
+    #[test]fn checkpoint_integrity_rejects_tamper(){
+       let mut s=State{root_id:"test-root-a".into(),root_sha:"a".repeat(64),epoch:2,
+        config_version:7,config_checksum:CONFIG_HASH.into(),ring_sha:"b".repeat(64),
+        generation:2,integrity:String::new()};
+       s.integrity=seal(&s);
+       assert!(check_state(&s).is_ok());
+       s.epoch=1;
+       assert!(check_state(&s).is_err());
+    }
+    #[test]fn checkpoint_state_schema_is_private_and_nonactuating(){
+       assert!(CHECKPOINT_FILE.ends_with(".sqlite"));
+       assert!(CHECKPOINT_SCHEMA.contains("detached_checkpoint"));
+       assert_eq!(DOMAIN,"hlaxs-access-production");
+    }
+
 }

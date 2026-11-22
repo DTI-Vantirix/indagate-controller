@@ -6,8 +6,8 @@ mod storage;
 use anyhow::{Result, anyhow};
 use tracing::info;
 
-fn run_access_self_test(db: &storage::NexusDatabase) -> Result<()> {
-    println!("=== NEXUS ACCESS SELF TEST ===");
+fn run_access_self_test(db: &storage::ControllerDatabase) -> Result<()> {
+    println!("=== INDAGATE ACCESS SELF TEST ===");
 
     let tests = [
         ("Known credential / Door 1", 95u8, 10773u16, 0u8),
@@ -110,7 +110,7 @@ async fn main() -> Result<()> {
 
         let identity = cloud::agent::enroll(token, &serial).await?;
 
-        println!("Nexus enrollment successful");
+        println!("Indagate enrollment successful");
         println!(
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
@@ -131,7 +131,7 @@ async fn main() -> Result<()> {
     }
 
     // A real diagnostic-only process must never start the normal access stack.
-    // In particular, do not open the Nexus database, initialize relay workers,
+    // In particular, do not open the Indagate database, initialize relay workers,
     // schedule unlocks, dispatch cloud door commands, or manipulate outputs.
     if std::env::var("HLAXS_WIEGAND_EDGE_DIAGNOSTIC").as_deref() == Ok("1") {
         if args.len() != 1 {
@@ -140,7 +140,7 @@ async fn main() -> Result<()> {
             ));
         }
         info!(
-            "HLAXS STRICT DIAGNOSTIC MODE: no access engine, schedules, relay worker, or cloud command agent"
+            "STRICT DIAGNOSTIC MODE: no access engine, schedules, relay worker, or cloud command agent"
         );
         let profile = hal::profile::acp4wr6_r1();
         // This worker uses the legacy-exported sysfs values in read-only mode.
@@ -173,7 +173,7 @@ async fn main() -> Result<()> {
         if !test_path.is_file() {
             return Err(anyhow!("migrate-only requires an existing database file"));
         }
-        let _database = storage::NexusDatabase::open(&explicit_path)?;
+        let _database = storage::ControllerDatabase::open(&explicit_path)?;
         println!("MIGRATION-ONLY PASSED — no hardware or cloud workers started");
         return Ok(());
     }
@@ -188,7 +188,7 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    let db = storage::NexusDatabase::open(&db_path)?;
+    let db = storage::ControllerDatabase::open(&db_path)?;
 
     db.set_config("hardware_model", profile.model)?;
     db.set_config("controller_mode", "observe")?;
@@ -201,13 +201,13 @@ async fn main() -> Result<()> {
     let health = hal::health::inspect();
     let inputs = hal::input::snapshot(&profile);
 
-    info!("Highline Nexus Controller starting");
+    info!("Indagate Controller starting");
     info!("Hardware profile: {}", profile.model);
 
     info!(
         database = %db_path,
         credentials = db.count_credentials()?,
-        "Local Nexus database ready"
+        "Local database ready"
     );
 
     println!("=== HARDWARE HEALTH ===");
@@ -218,12 +218,12 @@ async fn main() -> Result<()> {
     println!("{}", serde_json::to_string_pretty(&inputs)?);
 
     println!();
-    println!("=== NEXUS ACTIVE ACCESS MODE ===");
+    println!("=== INDAGATE ACTIVE ACCESS MODE ===");
 
     let (relay_tx, relay_rx) = tokio::sync::mpsc::channel(64);
 
     //
-    // If fire is already active when Nexus starts,
+    // If fire is already active when Indagate starts,
     // queue the fire override before any schedule
     // controller can issue steady relay commands.
     //

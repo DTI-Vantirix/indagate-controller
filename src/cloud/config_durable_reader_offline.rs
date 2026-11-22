@@ -1,4 +1,4 @@
-//! HLAXS.Access: developer-only durable mock replay + signed synthetic reader events.
+//! Indagate Access: developer-only durable mock replay + signed synthetic reader events.
 //! NOT registered by main.rs, cloud/mod.rs, agent.rs or HAL. No device I/O,
 //! network listeners, physical actuation, cloud ACK or production configuration writes.
 //! Signature keys here are DUMMY fixture keys, NOT physical reader credentials.

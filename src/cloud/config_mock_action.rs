@@ -1,4 +1,4 @@
-//! HLAXS.Access pure MOCK-only decision-to-action proposals.
+//! Indagate Access pure MOCK-only decision-to-action proposals.
 //! STANDALONE TEST CODE ONLY. Never register under cloud/mod.rs or main.rs.
 //! There are NO GPIO/HAL/relay/OS-command/network/cloud interfaces here.
 //! MockIntent is NOT a device command; MockSink only retains redacted memory.

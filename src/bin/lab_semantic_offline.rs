@@ -1,4 +1,4 @@
-//! HLAXS.Access v6: standalone SEMANTIC and PLAN simulation in WSL only.
+//! Indagate Access v6: standalone SEMANTIC and PLAN simulation in WSL only.
 //! Never invoked by controller main, never reaches cloud or physical devices.
 //! ALL persisted data lives in disposable owner-private /tmp directory.
 

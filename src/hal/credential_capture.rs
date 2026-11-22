@@ -38,7 +38,7 @@ fn eligible(frame: &CaptureFrame) -> bool {
         && frame.raw_bits.bytes().all(|b| b == b'0' || b == b'1')
 }
 
-// HLAXS 0.3.6 LOCAL SHADOW EMITTER. Never calls cloud or actuator APIs.
+// Indagate Access 0.3.6 LOCAL SHADOW EMITTER. Never calls cloud or actuator APIs.
 // The existing diagnostic capture worker delivers completed frames to this
 // non-blocking local publisher BEFORE the technician-session filter.
 fn publish_local_shadow(frame: &CaptureFrame) {
@@ -81,11 +81,11 @@ pub fn start() -> Option<SyncSender<CaptureFrame>> {
     let identity = match crate::cloud::agent::load_identity() {
         Ok(Some(id)) => id,
         Ok(None) => {
-            warn!(target:"hlaxs_v23_capture", "Capture upload disabled: device not enrolled");
+            warn!(target: "indagate_v23_capture", "Capture upload disabled: device not enrolled");
             return None;
         }
         Err(err) => {
-            warn!(target:"hlaxs_v23_capture", error=%err,"Capture upload disabled: cannot load identity");
+            warn!(target: "indagate_v23_capture", error=%err,"Capture upload disabled: cannot load identity");
             return None;
         }
     };
@@ -98,7 +98,7 @@ pub fn start() -> Option<SyncSender<CaptureFrame>> {
         {
             Ok(rt) => rt,
             Err(err) => {
-                warn!(target:"hlaxs_v23_capture",error=%err,"Capture runtime unavailable");
+                warn!(target: "indagate_v23_capture",error=%err,"Capture runtime unavailable");
                 return;
             }
         };
@@ -108,13 +108,13 @@ pub fn start() -> Option<SyncSender<CaptureFrame>> {
         {
             Ok(client) => client,
             Err(err) => {
-                warn!(target:"hlaxs_v23_capture",error=%err,"Capture HTTP unavailable");
+                warn!(target: "indagate_v23_capture",error=%err,"Capture HTTP unavailable");
                 return;
             }
         };
         let mut sessions: HashMap<usize, Session> = HashMap::new();
         let mut last_lookup = Instant::now() - Duration::from_secs(30);
-        info!(target:"hlaxs_v23_capture", "Read-only credential upload worker enabled");
+        info!(target: "indagate_v23_capture", "Read-only credential upload worker enabled");
         loop {
             if last_lookup.elapsed() >= Duration::from_secs(5) {
                 let result = rt.block_on(async {
@@ -147,7 +147,7 @@ pub fn start() -> Option<SyncSender<CaptureFrame>> {
                     }
                     Err(err) => {
                         sessions.clear();
-                        warn!(target:"hlaxs_v23_capture",error=%err,"Capture upload paused: session discovery failed");
+                        warn!(target: "indagate_v23_capture",error=%err,"Capture upload paused: session discovery failed");
                     }
                 }
                 last_lookup = Instant::now();
@@ -157,7 +157,7 @@ pub fn start() -> Option<SyncSender<CaptureFrame>> {
                     if !eligible(&frame) {
                         continue;
                     }
-                    // HLAXS 0.3.6: independent of technician capture sessions;
+                    // Indagate Access 0.3.6: independent of technician capture sessions;
                     // read-only local IPC only, sender is the existing GPIO owner.
                     publish_local_shadow(&frame);
                     let Some(session) = sessions.get(&frame.reader_number) else {
@@ -179,7 +179,7 @@ pub fn start() -> Option<SyncSender<CaptureFrame>> {
                         Ok::<_, anyhow::Error>(())
                     });
                     if let Err(err) = result {
-                        warn!(target:"hlaxs_v23_capture",reader=frame.reader_number,error=%err,"Diagnostic upload failed (no actuation)");
+                        warn!(target: "indagate_v23_capture",reader=frame.reader_number,error=%err,"Diagnostic upload failed (no actuation)");
                     }
                 }
                 Err(RecvTimeoutError::Timeout) => {}

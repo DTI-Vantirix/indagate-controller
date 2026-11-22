@@ -1,4 +1,4 @@
-//! HLAXS.Access: fail-closed, filesystem-backed configuration SHADOW staging.
+//! Indagate Access: fail-closed, filesystem-backed configuration SHADOW staging.
 //!
 //! This module is intentionally UNWIRED from cloud::agent::run(). It never
 //! applies a real configuration, changes the access-control DB, performs GPIO,

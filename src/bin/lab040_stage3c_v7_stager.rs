@@ -1,4 +1,4 @@
-//! HLAXS.Access 0.4 Stage 3C: isolated, non-actuating Rust v7 staging.
+//! Indagate Access 0.4 Stage 3C: isolated, non-actuating Rust v7 staging.
 //! Authenticated config GET -> validate -> independent durable SQLite snapshot.
 //! There is no config ACK, control write, systemd mutation or relay API here.
 #![allow(dead_code)]

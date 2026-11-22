@@ -9,7 +9,7 @@ use tokio::time::sleep;
 use tracing::{error, info, warn};
 use uuid::Uuid;
 
-use crate::storage::NexusDatabase;
+use crate::storage::ControllerDatabase;
 
 use super::profile::{BoardProfile, GpioLine};
 use super::relay_worker::RelayCommand;
@@ -64,7 +64,7 @@ fn electrical_state(raw: u8) -> &'static str {
 }
 
 fn queue_event(
-    db: &NexusDatabase,
+    db: &ControllerDatabase,
     event_type: &str,
     channel: Option<u8>,
     payload: serde_json::Value,
@@ -95,7 +95,7 @@ fn queue_event(
             event_type = event_type,
             channel = ?channel,
             error = %e,
-            "Unable to queue Nexus input event"
+            "Unable to queue Indagate input event"
         );
     }
 }
@@ -147,7 +147,7 @@ fn build_watch_list(profile: &BoardProfile) -> Vec<WatchedInput> {
 async fn process_initial_state(
     input: &WatchedInput,
     raw: u8,
-    db: &NexusDatabase,
+    db: &ControllerDatabase,
     relay_tx: &mpsc::Sender<RelayCommand>,
 ) {
     match input.kind {
@@ -172,7 +172,7 @@ async fn process_initial_state(
             );
 
             info!(
-                target: "nexus_door",
+                target: "indagate_door",
                 channel = channel,
                 door = channel + 1,
                 state = event_type,
@@ -183,7 +183,7 @@ async fn process_initial_state(
         InputKind::Rex => {
             //
             // Do not create an unlock merely because REX
-            // happens to be held when Nexus starts.
+            // happens to be held when Indagate starts.
             //
         }
 
@@ -225,7 +225,7 @@ async fn process_change(
     input: &WatchedInput,
     previous_raw: Option<u8>,
     raw: u8,
-    db: &NexusDatabase,
+    db: &ControllerDatabase,
     relay_tx: &mpsc::Sender<RelayCommand>,
 ) {
     match input.kind {
@@ -243,7 +243,7 @@ async fn process_change(
             let event_type = if raw == 1 { "door_open" } else { "door_closed" };
 
             info!(
-                target: "nexus_door",
+                target: "indagate_door",
                 event = event_type,
                 channel = channel,
                 door = channel + 1,
@@ -289,7 +289,7 @@ async fn process_change(
                         {
                             Ok(()) => {
                                 info!(
-                                    target: "nexus_rex",
+                                    target: "indagate_rex",
                                     channel = channel,
                                     door = channel + 1,
                                     duration_ms = duration_ms,
@@ -311,7 +311,7 @@ async fn process_change(
 
                             Err(e) => {
                                 error!(
-                                    target: "nexus_rex",
+                                    target: "indagate_rex",
                                     channel = channel,
                                     error = %e,
                                     "Unable to send REX relay command"
@@ -334,7 +334,7 @@ async fn process_change(
 
                     Ok(None) => {
                         warn!(
-                            target: "nexus_rex",
+                            target: "indagate_rex",
                             channel = channel,
                             "REX ignored because door is disabled or unconfigured"
                         );
@@ -354,7 +354,7 @@ async fn process_change(
 
                     Err(e) => {
                         error!(
-                            target: "nexus_rex",
+                            target: "indagate_rex",
                             channel = channel,
                             error = %e,
                             "Unable to load REX unlock duration"
@@ -363,7 +363,7 @@ async fn process_change(
                 }
             } else {
                 info!(
-                    target: "nexus_rex",
+                    target: "indagate_rex",
                     channel = channel,
                     door = channel + 1,
                     "REX RELEASED"
@@ -386,7 +386,7 @@ async fn process_change(
             let active = raw == 0;
 
             info!(
-                target: "nexus_fire",
+                target: "indagate_fire",
                 fire_active = active,
                 previous_raw = ?previous_raw,
                 raw = raw,
@@ -414,7 +414,7 @@ async fn process_change(
 
                 Err(e) => {
                     error!(
-                        target: "nexus_fire",
+                        target: "indagate_fire",
                         error = %e,
                         "Unable to send fire override command"
                     );
@@ -428,13 +428,13 @@ pub async fn run(profile: &BoardProfile, db_path: &str, relay_tx: mpsc::Sender<R
     const POLL_INTERVAL_MS: u64 = 20;
     const DEBOUNCE_MS: u64 = 75;
 
-    let db = match NexusDatabase::open(db_path) {
+    let db = match ControllerDatabase::open(db_path) {
         Ok(db) => db,
 
         Err(e) => {
             error!(
                 error = %e,
-                "Unable to open Nexus database for input monitor"
+                "Unable to open Indagate database for input monitor"
             );
 
             return;
@@ -461,7 +461,7 @@ pub async fn run(profile: &BoardProfile, db_path: &str, relay_tx: mpsc::Sender<R
                 input.last_raw = Some(raw);
 
                 info!(
-                    target: "nexus_input",
+                    target: "indagate_input",
                     event = "initial_state",
                     name = %input.name,
                     channel = ?input.channel,
@@ -543,7 +543,7 @@ pub async fn run(profile: &BoardProfile, db_path: &str, relay_tx: mpsc::Sender<R
             input.candidate_since = None;
 
             info!(
-                target: "nexus_input",
+                target: "indagate_input",
                 event = "state_change",
                 name = %input.name,
                 channel = ?input.channel,
