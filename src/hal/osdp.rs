@@ -32,7 +32,7 @@
 
 use anyhow::{Context, Result, bail};
 use libosdp::{
-    Channel, ControlPanel, ControlPanelBuilder, OsdpCommand, OsdpCommandBuzzer, OsdpCommandLed, OsdpEvent,
+    Channel, ControlPanel, ControlPanelBuilder, OsdpCommand, OsdpCommandBuzzer, OsdpCommandKeyset, OsdpCommandLed, OsdpEvent,
     OsdpEventCardRead, OsdpFlag, OsdpLedColor, OsdpLedParams, OsdpStatusReport, OsdpStatusReportType, PdInfoBuilder,
 };
 use std::sync::mpsc::{Receiver, channel};
@@ -59,6 +59,33 @@ pub struct OsdpReader {
     /// with the default key every OSDP reader accepts in its install mode, to hand the
     /// real key over. Nothing the reader sends is acted on until that is done.
     pub enrolling: bool,
+    /// A change of this reader's key that is under way. The bus itself ignores it; it
+    /// tells whoever runs the bus what to do next.
+    pub key_change: KeyChange,
+}
+
+/// Where a change of a reader's key stands.
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+pub enum KeyChange {
+    #[default]
+    None,
+    /// Run with the current key and, once the encrypted session is up, send this new one.
+    Send([u8; 16]),
+    /// The new key was sent: this session runs with the new key to see whether it took.
+    VerifyNew,
+    /// The new key was sent but did not answer: this session tries the old key again.
+    VerifyOld,
+}
+
+impl KeyChange {
+    fn name(self) -> &'static str {
+        match self {
+            KeyChange::None => "none",
+            KeyChange::Send(_) => "send",
+            KeyChange::VerifyNew => "verify_new",
+            KeyChange::VerifyOld => "verify_old",
+        }
+    }
 }
 
 /// The key is never printed.
@@ -70,6 +97,7 @@ impl std::fmt::Debug for OsdpReader {
             .field("baud_rate", &self.baud_rate)
             .field("has_key", &self.secure_channel_key.is_some())
             .field("enrolling", &self.enrolling)
+            .field("key_change", &self.key_change.name())
             .finish()
     }
 }
@@ -252,6 +280,19 @@ impl OsdpBus {
     /// What the readers reported about themselves since the last call.
     pub fn take_status(&mut self) -> Vec<ReaderStatus> {
         std::mem::take(&mut self.status)
+    }
+
+    /// Send the reader on `channel` a new secure-channel key, over its current encrypted
+    /// session. The reader then expects the new key; this bus keeps talking to it, but
+    /// whoever runs the bus should reopen it with the new key to confirm the change took.
+    pub fn set_key(&mut self, channel: u8, key: [u8; 16]) -> Result<()> {
+        let reader = self.channels.iter().position(|c| *c == channel).context("no such reader on this bus")?;
+        if !self.panel.is_sc_active(reader as i32) {
+            bail!("the reader's encrypted session is not up");
+        }
+        self.panel
+            .send_command(reader as i32, OsdpCommand::KeySet(OsdpCommandKeyset::new_scbk(key)))
+            .map_err(|err| anyhow::anyhow!("the key could not be sent: {err}"))
     }
 
     /// Show and sound the result of a card read at the reader on `channel`. A reader with
@@ -449,12 +490,27 @@ pub async fn run(serial_port: &str, db_path: &str, relay_tx: tokio::sync::mpsc::
             return;
         }
     };
-    let current_plan = |db: &crate::storage::ControllerDatabase| {
-        plan(&db.osdp_readers().unwrap_or_default(), |channel| db.osdp_reader_key(channel).ok().flatten(), chrono::Utc::now())
+    // While it is not known which of two keys a reader holds, sessions take turns with
+    // them; this counts the turns for each reader port.
+    let mut turns: std::collections::HashMap<u8, u32> = std::collections::HashMap::new();
+    let event = |db: &crate::storage::ControllerDatabase, name: &str, channel: u8| {
+        super::card_read::queue_event(db, name, channel, serde_json::json!({ "reader": channel + 1, "source": "osdp" }));
     };
     let mut last_waiting: Vec<u8> = Vec::new();
     loop {
-        let (readers, waiting) = current_plan(&db);
+        for channel in expire_key_changes(&db, chrono::Utc::now()) {
+            tracing::warn!(target: "indagate_osdp", reader = channel + 1, "OSDP reader key change ran out of time before it could start");
+            event(&db, "reader_secure_channel_rotate_expired", channel);
+        }
+        let current_plan = |db: &crate::storage::ControllerDatabase, turns: &std::collections::HashMap<u8, u32>| {
+            plan(
+                &db.osdp_readers().unwrap_or_default(),
+                |channel| db.osdp_reader_key(channel).ok().flatten(),
+                |channel| turns.get(&channel).copied().unwrap_or(0),
+                chrono::Utc::now(),
+            )
+        };
+        let (readers, waiting) = current_plan(&db, &turns);
         if waiting != last_waiting {
             for channel in &waiting {
                 tracing::warn!(
@@ -482,6 +538,7 @@ pub async fn run(serial_port: &str, db_path: &str, relay_tx: tokio::sync::mpsc::
         let started = std::time::Instant::now();
         let mut watches: Vec<ReaderWatch> = readers.iter().map(|_| ReaderWatch::default()).collect();
         let mut secure_since: Vec<Option<std::time::Instant>> = readers.iter().map(|_| None).collect();
+        let mut key_sent_at: Vec<Option<std::time::Instant>> = readers.iter().map(|_| None).collect();
         let mut settings_checked = std::time::Instant::now();
         'bus: loop {
             for read in bus.poll() {
@@ -489,69 +546,99 @@ pub async fn run(serial_port: &str, db_path: &str, relay_tx: tokio::sync::mpsc::
                 let outcome = super::card_read::handle(read, &db, &relay_tx).await;
                 bus.feedback(channel, feedback_for(outcome));
             }
-            // A reader going quiet, coming back, or reporting tamper or a power problem
-            // is recorded as an event, once per change.
             for (index, link) in bus.links().into_iter().enumerate() {
-                if let Some(event) = watches[index].link_event(link.online, started.elapsed()) {
-                    tracing::info!(target: "indagate_osdp", reader = link.channel + 1, event, secure = link.secure, "OSDP reader link changed");
+                // A reader going quiet or coming back is recorded as an event, once per change.
+                if let Some(name) = watches[index].link_event(link.online, started.elapsed()) {
+                    tracing::info!(target: "indagate_osdp", reader = link.channel + 1, event = name, secure = link.secure, "OSDP reader link changed");
                     super::card_read::queue_event(
                         &db,
-                        event,
+                        name,
                         link.channel,
                         serde_json::json!({ "reader": link.channel + 1, "source": "osdp", "secure_channel": link.secure }),
                     );
                 }
-                // A reader being given its key: once its encrypted session holds, the key
-                // is recorded as taken and the bus restarts with that reader enforced.
-                if readers[index].enrolling {
-                    if !link.secure {
-                        secure_since[index] = None;
-                    } else if secure_since[index].get_or_insert_with(std::time::Instant::now).elapsed() >= SECURE_HELD_FOR {
-                        match db.osdp_mark_enrolled(link.channel) {
-                            Ok(()) => {
-                                tracing::info!(target: "indagate_osdp", reader = link.channel + 1, "OSDP reader has taken its secure-channel key");
-                                super::card_read::queue_event(
-                                    &db,
-                                    "reader_secure_channel_enrolled",
-                                    link.channel,
-                                    serde_json::json!({ "reader": link.channel + 1, "source": "osdp" }),
-                                );
-                                break 'bus;
-                            }
-                            Err(err) => tracing::error!(target: "indagate_osdp", error = %err, "could not record the reader's key as taken"),
+                let reader = &readers[index];
+                let held = if link.secure {
+                    Some(secure_since[index].get_or_insert_with(std::time::Instant::now).elapsed())
+                } else {
+                    secure_since[index] = None;
+                    None
+                };
+                // What to do about a key being handed over or changed (see `key_step`).
+                match key_step(reader, held, started.elapsed(), key_sent_at[index].map(|at| at.elapsed())) {
+                    KeyStep::Wait => {}
+                    KeyStep::Enrolled => match db.osdp_mark_enrolled(link.channel) {
+                        Ok(()) => {
+                            tracing::info!(target: "indagate_osdp", reader = link.channel + 1, "OSDP reader has taken its secure-channel key");
+                            event(&db, "reader_secure_channel_enrolled", link.channel);
+                            break 'bus;
                         }
+                        Err(err) => tracing::error!(target: "indagate_osdp", error = %err, "could not record the reader's key as taken"),
+                    },
+                    KeyStep::SendNew(key) => {
+                        // Recorded as sent before it is sent: if the controller stops in
+                        // between, both keys are still tried afterwards.
+                        if db.osdp_rotation_sent(link.channel, true).is_ok() {
+                            match bus.set_key(link.channel, key) {
+                                Ok(()) => {
+                                    tracing::info!(target: "indagate_osdp", reader = link.channel + 1, "new secure-channel key sent to the OSDP reader");
+                                    key_sent_at[index] = Some(std::time::Instant::now());
+                                }
+                                Err(err) => {
+                                    tracing::warn!(target: "indagate_osdp", reader = link.channel + 1, error = %err, "new key not sent; will try again");
+                                    let _ = db.osdp_rotation_sent(link.channel, false);
+                                }
+                            }
+                        }
+                    }
+                    // The key was sent a moment ago: reopen the bus to see which key answers.
+                    KeyStep::Reopen => break 'bus,
+                    KeyStep::NewKeyWorks => {
+                        if db.osdp_commit_rotation(link.channel).is_ok() {
+                            turns.remove(&link.channel);
+                            tracing::info!(target: "indagate_osdp", reader = link.channel + 1, "OSDP reader answers to its new secure-channel key");
+                            event(&db, "reader_secure_channel_rotated", link.channel);
+                            break 'bus;
+                        }
+                    }
+                    KeyStep::OldKeyStillWorks => {
+                        // The reader did not take the new key. Back to before it was sent;
+                        // it is sent again if there is still time, otherwise given up.
+                        if db.osdp_rotation_sent(link.channel, false).is_ok() {
+                            turns.remove(&link.channel);
+                            tracing::warn!(target: "indagate_osdp", reader = link.channel + 1, "OSDP reader did not take its new key; it still answers to the old one");
+                            break 'bus;
+                        }
+                    }
+                    KeyStep::TryOtherKey => {
+                        *turns.entry(link.channel).or_insert(0) += 1;
+                        break 'bus;
                     }
                 }
             }
+            // Tamper and power reports, once per change.
             for status in bus.take_status() {
                 let Some(watch) = bus_index(&bus, status.channel).and_then(|i| watches.get_mut(i)) else { continue };
-                for event in watch.status_events(status.tamper, status.power_failure) {
-                    tracing::warn!(target: "indagate_osdp", reader = status.channel + 1, event, "OSDP reader status changed");
-                    super::card_read::queue_event(
-                        &db,
-                        event,
-                        status.channel,
-                        serde_json::json!({ "reader": status.channel + 1, "source": "osdp" }),
-                    );
+                for name in watch.status_events(status.tamper, status.power_failure) {
+                    tracing::warn!(target: "indagate_osdp", reader = status.channel + 1, event = name, "OSDP reader status changed");
+                    event(&db, name, status.channel);
                 }
             }
             if settings_checked.elapsed() >= SETTINGS_CHECK_EVERY {
                 settings_checked = std::time::Instant::now();
-                let (now_readers, now_waiting) = current_plan(&db);
+                let (now_readers, now_waiting) = current_plan(&db, &turns);
                 if now_readers != readers {
                     // An enrolment that ran out of time without the reader taking its key.
                     for reader in readers.iter().filter(|r| r.enrolling) {
                         if now_waiting.contains(&reader.channel) {
                             tracing::warn!(target: "indagate_osdp", reader = reader.channel + 1, "OSDP reader enrolment ran out of time");
-                            super::card_read::queue_event(
-                                &db,
-                                "reader_secure_channel_enroll_expired",
-                                reader.channel,
-                                serde_json::json!({ "reader": reader.channel + 1, "source": "osdp" }),
-                            );
+                            event(&db, "reader_secure_channel_enroll_expired", reader.channel);
                         }
                     }
                     tracing::info!(target: "indagate_osdp", "OSDP reader settings changed; restarting the bus");
+                    break;
+                }
+                if !expire_key_changes_pending(&db, chrono::Utc::now()).is_empty() {
                     break;
                 }
             }
@@ -560,26 +647,125 @@ pub async fn run(serial_port: &str, db_path: &str, relay_tx: tokio::sync::mpsc::
     }
 }
 
+/// How long after a new key is sent before the bus is reopened to see which key answers.
+const REOPEN_AFTER_KEY_SENT: std::time::Duration = std::time::Duration::from_secs(3);
+/// How long a session waits for a key to answer before the other key gets its turn.
+const KEY_TURN: std::time::Duration = std::time::Duration::from_secs(20);
+/// How long the encrypted session must be up before a new key is sent over it.
+const SEND_KEY_AFTER: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// What to do next about a reader's key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeyStep {
+    Wait,
+    /// A reader being enrolled has taken its key.
+    Enrolled,
+    /// Send this new key over the current session.
+    SendNew([u8; 16]),
+    /// The new key was sent; close the bus and reopen it to confirm.
+    Reopen,
+    NewKeyWorks,
+    OldKeyStillWorks,
+    /// The key this session uses did not answer; let the other have a turn.
+    TryOtherKey,
+}
+
+impl std::fmt::Debug for KeyChange {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
+/// Decide the next step from how the reader is being run and what has been seen:
+/// `secure_for` is how long its encrypted session has been up without a break (if it is),
+/// `session_age` how long this bus has been open, `sent_ago` how long since a new key was
+/// sent in this session.
+fn key_step(
+    reader: &OsdpReader,
+    secure_for: Option<std::time::Duration>,
+    session_age: std::time::Duration,
+    sent_ago: Option<std::time::Duration>,
+) -> KeyStep {
+    let held = |needed| secure_for.is_some_and(|up| up >= needed);
+    if reader.enrolling {
+        return if held(SECURE_HELD_FOR) { KeyStep::Enrolled } else { KeyStep::Wait };
+    }
+    match reader.key_change {
+        KeyChange::None => KeyStep::Wait,
+        KeyChange::Send(key) => match sent_ago {
+            None if held(SEND_KEY_AFTER) => KeyStep::SendNew(key),
+            None => KeyStep::Wait,
+            Some(ago) if ago >= REOPEN_AFTER_KEY_SENT => KeyStep::Reopen,
+            Some(_) => KeyStep::Wait,
+        },
+        KeyChange::VerifyNew if held(SECURE_HELD_FOR) => KeyStep::NewKeyWorks,
+        KeyChange::VerifyOld if held(SECURE_HELD_FOR) => KeyStep::OldKeyStillWorks,
+        // Not up yet. While the session is up but has not held long enough, keep waiting.
+        KeyChange::VerifyNew | KeyChange::VerifyOld => {
+            if secure_for.is_none() && session_age >= KEY_TURN { KeyStep::TryOtherKey } else { KeyStep::Wait }
+        }
+    }
+}
+
+/// Key changes that were asked for, never sent, and have run out of time.
+fn expire_key_changes_pending(db: &crate::storage::ControllerDatabase, now: chrono::DateTime<chrono::Utc>) -> Vec<u8> {
+    db.osdp_readers()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|reader| reader.0)
+        .filter(|&channel| {
+            db.osdp_reader_key(channel).ok().flatten().is_some_and(|key| {
+                key.next_key.is_some() && !key.rotate_sent && key.rotate_until.is_none_or(|until| now >= until)
+            })
+        })
+        .collect()
+}
+
+/// Give those up, and say which reader ports they were for.
+fn expire_key_changes(db: &crate::storage::ControllerDatabase, now: chrono::DateTime<chrono::Utc>) -> Vec<u8> {
+    expire_key_changes_pending(db, now)
+        .into_iter()
+        .filter(|&channel| db.osdp_cancel_rotation(channel).unwrap_or(false))
+        .collect()
+}
+
 /// How each configured reader is to be run right now, and the reader ports that must wait
 /// because they are set to use the secure channel and have no usable key.
 ///
-/// `configured` is (channel, address, line speed, secure channel required).
+/// `configured` is (channel, address, line speed, secure channel required). `turn_of` is
+/// how many times a reader whose key is uncertain has had the other key tried.
 fn plan(
     configured: &[(u8, u8, u32, bool)],
     key_of: impl Fn(u8) -> Option<crate::storage::OsdpReaderKey>,
+    turn_of: impl Fn(u8) -> u32,
     now: chrono::DateTime<chrono::Utc>,
 ) -> (Vec<OsdpReader>, Vec<u8>) {
     let mut readers = Vec::new();
     let mut waiting = Vec::new();
     for &(channel, address, baud_rate, secure) in configured {
-        let reader = |secure_channel_key, enrolling| OsdpReader { channel, address, baud_rate, secure_channel_key, enrolling };
+        let reader = |secure_channel_key, enrolling, key_change| OsdpReader {
+            channel,
+            address,
+            baud_rate,
+            secure_channel_key,
+            enrolling,
+            key_change,
+        };
         if !secure {
-            readers.push(reader(None, false));
+            readers.push(reader(None, false, KeyChange::None));
             continue;
         }
         match key_of(channel) {
-            Some(key) if key.active => readers.push(reader(Some(key.key), false)),
-            Some(key) if key.enroll_until.is_some_and(|until| now < until) => readers.push(reader(Some(key.key), true)),
+            Some(key) if key.active => readers.push(match key.next_key {
+                None => reader(Some(key.key), false, KeyChange::None),
+                Some(next) if !key.rotate_sent => reader(Some(key.key), false, KeyChange::Send(next)),
+                // Sent: the reader holds one of the two. The new one is tried first.
+                Some(next) if turn_of(channel) % 2 == 0 => reader(Some(next), false, KeyChange::VerifyNew),
+                Some(_) => reader(Some(key.key), false, KeyChange::VerifyOld),
+            }),
+            Some(key) if key.enroll_until.is_some_and(|until| now < until) => {
+                readers.push(reader(Some(key.key), true, KeyChange::None))
+            }
             // No key, or one whose hand-over time has passed: never run in the clear.
             _ => waiting.push(channel),
         }
@@ -662,6 +848,45 @@ fn enroll(
         "message": "put the reader in its install mode now; the key is handed over when it answers",
         "reader_number": channel + 1,
         "enroll_until": until.to_rfc3339(),
+    }))
+}
+
+/// Command `osdp_reader_rotate_key`: change the key of a reader that already has one.
+/// The new key is sent over the reader's current encrypted session, so the reader must be
+/// connected; nothing has to be done at the reader. Payload: `reader_number`, optional
+/// `window_seconds` (how long to wait for the reader to be connected).
+pub fn rotate_key_command(payload: &serde_json::Value) -> Result<serde_json::Value> {
+    rotate_key(&command_database()?, payload, chrono::Utc::now())
+}
+
+fn rotate_key(
+    db: &crate::storage::ControllerDatabase,
+    payload: &serde_json::Value,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<serde_json::Value> {
+    let channel = command_channel(payload)?;
+    let window = match payload.get("window_seconds") {
+        None | Some(serde_json::Value::Null) => ENROLL_WINDOW_SECONDS,
+        Some(value) => value
+            .as_i64()
+            .filter(|seconds| ENROLL_WINDOW_RANGE.contains(seconds))
+            .context("window_seconds must be from 60 to 3600")?,
+    };
+    match db.osdp_reader_key(channel)? {
+        Some(held) if held.active => {}
+        Some(_) => bail!("reader {} has not taken its first key yet; finish enrolling it first", channel + 1),
+        None => bail!("reader {} has no key to change; enroll it first", channel + 1),
+    }
+    use ring::rand::SecureRandom;
+    let mut next = [0u8; 16];
+    ring::rand::SystemRandom::new().fill(&mut next).map_err(|_| anyhow::anyhow!("no random source for a key"))?;
+    let until = now + chrono::Duration::seconds(window);
+    // A change already under way keeps its own new key; only its time is extended.
+    db.osdp_begin_rotation(channel, next, until)?;
+    Ok(serde_json::json!({
+        "message": "the new key is sent to the reader over its encrypted link as soon as it is connected",
+        "reader_number": channel + 1,
+        "rotate_until": until.to_rfc3339(),
     }))
 }
 
@@ -874,7 +1099,7 @@ mod tests {
     }
 
     fn reader_on_port_one(key: Option<[u8; 16]>) -> OsdpReader {
-        OsdpReader { channel: 0, address: 7, baud_rate: 9600, secure_channel_key: key, enrolling: false }
+        OsdpReader { channel: 0, address: 7, baud_rate: 9600, secure_channel_key: key, enrolling: false, key_change: KeyChange::None }
     }
 
     #[test]
@@ -1096,7 +1321,7 @@ mod tests {
 
     #[test]
     fn readers_on_one_line_must_share_a_speed() {
-        let slow = OsdpReader { channel: 0, address: 1, baud_rate: 9600, secure_channel_key: None, enrolling: false };
+        let slow = OsdpReader { channel: 0, address: 1, baud_rate: 9600, secure_channel_key: None, enrolling: false, key_change: KeyChange::None };
         let fast = OsdpReader { channel: 1, address: 2, baud_rate: 115200, ..slow.clone() };
         let error = open_bus("/nonexistent/port", &[slow, fast]).err().unwrap().to_string();
         assert!(error.contains("different speeds"), "{error}");
@@ -1365,6 +1590,9 @@ mod tests {
             key: KEY,
             active,
             enroll_until: until_seconds_from_now.map(|s| now + chrono::Duration::seconds(s)),
+            next_key: None,
+            rotate_until: None,
+            rotate_sent: false,
         }
     }
 
@@ -1379,6 +1607,7 @@ mod tests {
                 2 => Some(held(false, Some(60), now)), // being handed its key
                 _ => None,                             // secure, never enrolled
             },
+            |_| 0,
             now,
         );
         assert_eq!(waiting, vec![3]);
@@ -1386,7 +1615,7 @@ mod tests {
         assert_eq!(summary, vec![(0, false, false), (1, true, false), (2, true, true)]);
 
         // Once the hand-over time has passed the reader waits again rather than run plain.
-        let (readers, waiting) = plan(&[(2, 3, 9600, true)], |_| Some(held(false, Some(-1), now)), now);
+        let (readers, waiting) = plan(&[(2, 3, 9600, true)], |_| Some(held(false, Some(-1), now)), |_| 0, now);
         assert!(readers.is_empty());
         assert_eq!(waiting, vec![2]);
     }
@@ -1467,5 +1696,171 @@ mod tests {
         let printed = format!("{:?}", reader_on_port_one(Some(KEY)));
         assert!(printed.contains("has_key: true"), "{printed}");
         assert!(!printed.contains("148") && !printed.contains("0x94"), "{printed}");
+    }
+
+    // ---------- secure channel: changing a reader's key ----------
+
+    const NEW_KEY: [u8; 16] = [
+        0x11, 0x5a, 0x0c, 0xe7, 0x38, 0x90, 0xbd, 0x44, 0x6f, 0x02, 0xd1, 0x7b, 0xa6, 0x3e, 0xc8, 0x59,
+    ];
+
+    #[test]
+    fn a_reader_changes_to_a_new_key_sent_over_its_encrypted_session() {
+        let (controller_end, reader_end) = memory_wire();
+        let (_, packed) = card_26(5, 22271);
+        let stop = Arc::new(AtomicBool::new(false));
+        let reader = simulated_reader(reader_end, 7, Some(KEY), packed, 26, stop.clone());
+
+        // Up under the current key, then the new key is sent.
+        let mut bus = OsdpBus::open(Box::new(controller_end.again()), &[reader_on_port_one(Some(KEY))]).unwrap();
+        let (up, _) = wait_for_secure(&mut bus, Duration::from_secs(15));
+        let sent = bus.set_key(0, NEW_KEY);
+        let no_such_reader = bus.set_key(3, NEW_KEY);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            bus.poll();
+            thread::sleep(Duration::from_millis(5));
+        }
+        drop(bus);
+        controller_end.drain();
+
+        // The reader now answers to the new key...
+        let mut bus = OsdpBus::open(Box::new(controller_end.again()), &[reader_on_port_one(Some(NEW_KEY))]).unwrap();
+        let (new_key_works, _) = wait_for_secure(&mut bus, Duration::from_secs(15));
+        drop(bus);
+        controller_end.drain();
+
+        // ...and no longer to the old one.
+        let mut bus = OsdpBus::open(Box::new(controller_end.again()), &[reader_on_port_one(Some(KEY))]).unwrap();
+        let (old_key_works, _) = wait_for_secure(&mut bus, Duration::from_secs(4));
+
+        stop.store(true, Ordering::Relaxed);
+        reader.join().unwrap();
+
+        assert!(up, "the reader never came up under its current key");
+        assert!(sent.is_ok(), "{sent:?}");
+        assert!(no_such_reader.is_err());
+        assert!(new_key_works, "the reader does not answer to the key it was sent");
+        assert!(!old_key_works, "the reader still answers to the key that was replaced");
+    }
+
+    #[test]
+    fn a_new_key_is_not_sent_to_a_reader_whose_encrypted_session_is_down() {
+        let (controller_end, _nobody_listening) = memory_wire();
+        let mut bus = OsdpBus::open(Box::new(controller_end), &[reader_on_port_one(Some(KEY))]).unwrap();
+        bus.poll();
+        let error = bus.set_key(0, NEW_KEY).unwrap_err().to_string();
+        assert!(error.contains("not up"), "{error}");
+    }
+
+    fn changing(sent: bool, now: chrono::DateTime<chrono::Utc>) -> crate::storage::OsdpReaderKey {
+        crate::storage::OsdpReaderKey {
+            next_key: Some(NEW_KEY),
+            rotate_until: Some(now + chrono::Duration::seconds(600)),
+            rotate_sent: sent,
+            ..held(true, None, now)
+        }
+    }
+
+    #[test]
+    fn a_key_change_keeps_both_keys_until_one_is_seen_to_work() {
+        let now = chrono::Utc::now();
+        let configured = [(0, 7, 9600, true)];
+        let run = |sent: bool, turn: u32| {
+            let (readers, waiting) = plan(&configured, |_| Some(changing(sent, now)), |_| turn, now);
+            assert!(waiting.is_empty());
+            (readers[0].secure_channel_key.unwrap(), readers[0].key_change, readers[0].enrolling)
+        };
+        // Not sent yet: the current key, with the new one to send.
+        assert_eq!(run(false, 0), (KEY, KeyChange::Send(NEW_KEY), false));
+        assert_eq!(run(false, 7), (KEY, KeyChange::Send(NEW_KEY), false));
+        // Sent: the reader may hold either, so they take turns, the new one first.
+        assert_eq!(run(true, 0), (NEW_KEY, KeyChange::VerifyNew, false));
+        assert_eq!(run(true, 1), (KEY, KeyChange::VerifyOld, false));
+        assert_eq!(run(true, 2), (NEW_KEY, KeyChange::VerifyNew, false));
+    }
+
+    #[test]
+    fn each_step_of_a_key_change_waits_for_what_it_needs() {
+        let s = Duration::from_secs;
+        let with = |key_change| OsdpReader { key_change, ..reader_on_port_one(Some(KEY)) };
+
+        let quiet = with(KeyChange::None);
+        assert_eq!(key_step(&quiet, Some(s(60)), s(60), None), KeyStep::Wait);
+
+        let enrolling = OsdpReader { enrolling: true, ..reader_on_port_one(Some(KEY)) };
+        assert_eq!(key_step(&enrolling, Some(s(4)), s(30), None), KeyStep::Wait);
+        assert_eq!(key_step(&enrolling, Some(s(5)), s(30), None), KeyStep::Enrolled);
+        assert_eq!(key_step(&enrolling, None, s(300), None), KeyStep::Wait);
+
+        let send = with(KeyChange::Send(NEW_KEY));
+        assert_eq!(key_step(&send, None, s(60), None), KeyStep::Wait, "nothing is sent without an encrypted session");
+        assert_eq!(key_step(&send, Some(s(1)), s(60), None), KeyStep::Wait);
+        assert_eq!(key_step(&send, Some(s(2)), s(60), None), KeyStep::SendNew(NEW_KEY));
+        assert_eq!(key_step(&send, Some(s(9)), s(60), Some(s(1))), KeyStep::Wait, "sent once, not again");
+        assert_eq!(key_step(&send, None, s(60), Some(s(3))), KeyStep::Reopen);
+
+        let verify_new = with(KeyChange::VerifyNew);
+        assert_eq!(key_step(&verify_new, Some(s(4)), s(10), None), KeyStep::Wait);
+        assert_eq!(key_step(&verify_new, Some(s(5)), s(10), None), KeyStep::NewKeyWorks);
+        assert_eq!(key_step(&verify_new, None, s(19), None), KeyStep::Wait);
+        assert_eq!(key_step(&verify_new, None, s(20), None), KeyStep::TryOtherKey);
+        assert_eq!(key_step(&verify_new, Some(s(1)), s(25), None), KeyStep::Wait, "a session that just came up gets to prove itself");
+
+        let verify_old = with(KeyChange::VerifyOld);
+        assert_eq!(key_step(&verify_old, Some(s(5)), s(10), None), KeyStep::OldKeyStillWorks);
+        assert_eq!(key_step(&verify_old, None, s(20), None), KeyStep::TryOtherKey);
+    }
+
+    #[test]
+    fn a_key_change_is_asked_for_recorded_and_never_loses_a_key() {
+        let db = database_with_reader(true);
+        let now = chrono::Utc::now();
+        let payload = serde_json::json!({ "reader_number": 1 });
+
+        // Only a reader that has taken its first key can have it changed.
+        let error = rotate_key(&db, &payload, now).unwrap_err().to_string();
+        assert!(error.contains("no key to change"), "{error}");
+        enroll(&db, &payload, now).unwrap();
+        let error = rotate_key(&db, &payload, now).unwrap_err().to_string();
+        assert!(error.contains("has not taken its first key"), "{error}");
+        db.osdp_mark_enrolled(0).unwrap();
+        let original = db.osdp_reader_key(0).unwrap().unwrap().key;
+
+        let result = rotate_key(&db, &payload, now).unwrap();
+        let mut fields: Vec<&String> = result.as_object().unwrap().keys().collect();
+        fields.sort();
+        assert_eq!(fields, ["message", "reader_number", "rotate_until"], "the result holds no key");
+        let started = db.osdp_reader_key(0).unwrap().unwrap();
+        let next = started.next_key.expect("a new key is held");
+        assert_eq!(started.key, original, "the current key is untouched");
+        assert_ne!(next, original);
+        assert!(!started.rotate_sent);
+
+        // Asked again: the same new key, more time.
+        rotate_key(&db, &serde_json::json!({ "reader_number": 1, "window_seconds": 900 }), now).unwrap();
+        let again = db.osdp_reader_key(0).unwrap().unwrap();
+        assert_eq!(again.next_key, Some(next));
+        assert_eq!(again.rotate_until.unwrap().timestamp(), (now + chrono::Duration::seconds(900)).timestamp());
+
+        // Out of time before it was ever sent: given up, current key kept.
+        assert!(expire_key_changes(&db, now + chrono::Duration::seconds(899)).is_empty());
+        assert_eq!(expire_key_changes(&db, now + chrono::Duration::seconds(901)), vec![0]);
+        let after = db.osdp_reader_key(0).unwrap().unwrap();
+        assert_eq!((after.key, after.next_key), (original, None));
+
+        // Once sent, running out of time gives up nothing: the reader may hold the new key.
+        rotate_key(&db, &payload, now).unwrap();
+        let next = db.osdp_reader_key(0).unwrap().unwrap().next_key.unwrap();
+        db.osdp_rotation_sent(0, true).unwrap();
+        assert!(expire_key_changes(&db, now + chrono::Duration::days(30)).is_empty());
+        assert!(!db.osdp_cancel_rotation(0).unwrap());
+        let sent = db.osdp_reader_key(0).unwrap().unwrap();
+        assert_eq!((sent.key, sent.next_key, sent.rotate_sent), (original, Some(next), true));
+
+        // The new key is seen to work: it becomes the key, and the change is over.
+        db.osdp_commit_rotation(0).unwrap();
+        let done = db.osdp_reader_key(0).unwrap().unwrap();
+        assert_eq!((done.key, done.next_key, done.rotate_sent, done.active), (next, None, false, true));
     }
 }

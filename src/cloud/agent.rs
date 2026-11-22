@@ -676,6 +676,8 @@ async fn upload_events(identity: &DeviceIdentity, db: &ControllerDatabase) -> Re
             | "reader_power_restored"
             | "reader_secure_channel_enrolled"
             | "reader_secure_channel_enroll_expired"
+            | "reader_secure_channel_rotated"
+            | "reader_secure_channel_rotate_expired"
             | "access_error"
             | "rex_error"
             | "rex_ignored" => "system",
@@ -834,6 +836,7 @@ async fn handle_command(
             // replaced. The key itself never appears in a command or a result.
             "osdp_reader_enroll" => crate::hal::osdp::enroll_command(&command.payload),
             "osdp_reader_forget_key" => crate::hal::osdp::forget_key_command(&command.payload),
+            "osdp_reader_rotate_key" => crate::hal::osdp::rotate_key_command(&command.payload),
 
             "wifi_profile_preflight" => {
                 let profile_name = command.payload["profile_name"]
