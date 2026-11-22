@@ -3,7 +3,6 @@ pub mod agent;
 // Cloud address, trusted certificate authorities, shared HTTP client and push stream.
 pub mod endpoint;
 pub mod config_shadow;
-pub mod unified_shadow_040;
 
 // SA-15A: diagnostic only; not wired into live authorization or enrollment.
 pub mod device_trust;

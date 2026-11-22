@@ -280,7 +280,9 @@ pub fn run(profile: &BoardProfile) -> Result<(), String> {
         lines.push(open_line(gpio_number(&reader.d1)?, channel, 1)?);
     }
     let capture_sender = super::credential_capture::start();
-    let shadow_sender = crate::cloud::unified_shadow_040::start();
+    // The bench shadow-policy worker that used to listen here needed a hosted service that
+    // no longer exists, and was removed.
+    let shadow_sender: Option<SyncSender<super::credential_capture::CaptureFrame>> = None;
     let mut frames: Vec<Frame> = (0..profile.readers.len())
         .map(|_| Frame::default())
         .collect();
