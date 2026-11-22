@@ -159,6 +159,37 @@ pub async fn handle(
     let CardRead { channel, bits, source } = read;
     let raw_bits = bit_string(&bits);
 
+    // A port answers only to the protocol it is configured for. A Wiegand reader left
+    // wired to a port that has been set to OSDP (or the reverse) must not open the door.
+    // A port with no configuration falls through to the engine, which denies it.
+    if let Ok(Some(configured)) = db.reader_protocol(channel) {
+        if configured != source.name() {
+            warn!(
+                target: "indagate_access",
+                reader = channel + 1,
+                channel = channel,
+                configured = %configured,
+                received = source.name(),
+                "Card read ignored: reader port is configured for another protocol"
+            );
+            queue_event(
+                db,
+                "access_deny",
+                channel,
+                json!({
+                    "reader": channel + 1,
+                    "bits": bits.len(),
+                    "raw_bits": raw_bits,
+                    "decision": "Deny",
+                    "reason": "reader_protocol_mismatch",
+                    "configured_protocol": configured,
+                    "source": source.name()
+                }),
+            );
+            return ReadOutcome::Denied;
+        }
+    }
+
     let Some((facility, card, full, parity_valid)) = decode_26(&bits) else {
         warn!(
             target: "indagate_wiegand",
@@ -484,10 +515,72 @@ mod tests {
     #[tokio::test]
     async fn an_osdp_read_decides_the_same_and_says_where_it_came_from() {
         let db = database_with_one_card();
+        db.connection()
+            .execute("UPDATE reader_config SET protocol = 'osdp', osdp_address = 7 WHERE reader_number = 1", [])
+            .unwrap();
         let (tx, mut rx) = mpsc::channel(4);
         let outcome = handle(read(frame_26(5, 22271), ReadSource::Osdp), &db, &tx).await;
         assert_eq!(outcome, ReadOutcome::Granted { relay_command_queued: true });
         assert!(rx.try_recv().is_ok());
         assert_eq!(events(&db)[0].1["source"], "osdp");
+    }
+
+    #[tokio::test]
+    async fn a_wiegand_card_at_a_port_set_to_osdp_does_not_open_the_door() {
+        let db = database_with_one_card();
+        db.connection()
+            .execute("UPDATE reader_config SET protocol = 'osdp', osdp_address = 7 WHERE reader_number = 1", [])
+            .unwrap();
+        let (tx, mut rx) = mpsc::channel(4);
+        let outcome = handle(read(frame_26(5, 22271), ReadSource::Wiegand), &db, &tx).await;
+        assert_eq!(outcome, ReadOutcome::Denied);
+        assert!(rx.try_recv().is_err(), "no relay command");
+        let events = events(&db);
+        assert_eq!(events[0].0, "access_deny");
+        assert_eq!(events[0].1["reason"], "reader_protocol_mismatch");
+        assert_eq!(events[0].1["configured_protocol"], "osdp");
+        assert_eq!(events[0].1["source"], "wiegand");
+    }
+
+    #[tokio::test]
+    async fn an_osdp_card_at_a_port_set_to_wiegand_does_not_open_the_door() {
+        let db = database_with_one_card();
+        let (tx, mut rx) = mpsc::channel(4);
+        let outcome = handle(read(frame_26(5, 22271), ReadSource::Osdp), &db, &tx).await;
+        assert_eq!(outcome, ReadOutcome::Denied);
+        assert!(rx.try_recv().is_err(), "no relay command");
+        assert_eq!(events(&db)[0].1["reason"], "reader_protocol_mismatch");
+    }
+
+    #[test]
+    fn an_older_database_gains_the_protocol_columns_and_stays_wiegand() {
+        let path = std::env::temp_dir().join(format!("indagate-reader-columns-{}.db", Uuid::new_v4()));
+        {
+            // The reader table as it was before ports had a protocol.
+            let old = rusqlite::Connection::open(&path).unwrap();
+            old.execute_batch(
+                r#"
+                CREATE TABLE reader_config (
+                    reader_number INTEGER PRIMARY KEY CHECK(reader_number BETWEEN 1 AND 4),
+                    reader_id TEXT NOT NULL UNIQUE,
+                    enabled INTEGER NOT NULL CHECK(enabled IN (0,1)),
+                    door_channel INTEGER NOT NULL CHECK(door_channel BETWEEN 0 AND 3),
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+                INSERT INTO reader_config (reader_number, reader_id, enabled, door_channel) VALUES (2, 'reader2', 1, 1);
+                "#,
+            )
+            .unwrap();
+        }
+        let db = ControllerDatabase::open(path.to_str().unwrap()).unwrap();
+        assert_eq!(db.reader_protocol(1).unwrap().as_deref(), Some("wiegand"));
+        assert_eq!(db.reader_protocol(0).unwrap(), None);
+        assert!(db.osdp_readers().unwrap().is_empty());
+        db.connection()
+            .execute("UPDATE reader_config SET protocol = 'osdp', osdp_address = 12, osdp_baud_rate = 38400", [])
+            .unwrap();
+        assert_eq!(db.osdp_readers().unwrap(), vec![(1, 12, 38400)]);
+        drop(db);
+        let _ = std::fs::remove_file(&path);
     }
 }
