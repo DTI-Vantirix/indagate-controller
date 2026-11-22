@@ -261,8 +261,9 @@ fn save_identity(identity: &DeviceIdentity) -> Result<()> {
     save_identity_atomic(identity)
 }
 
+/// The shared HTTP client (see `cloud::endpoint`): one connection reused for every call.
 fn client() -> Result<Client> {
-    Ok(Client::builder().timeout(Duration::from_secs(15)).build()?)
+    super::endpoint::client()
 }
 
 pub async fn enroll(enrollment_token: &str, hardware_serial: &str) -> Result<DeviceIdentity> {
@@ -284,7 +285,7 @@ pub async fn enroll(enrollment_token: &str, hardware_serial: &str) -> Result<Dev
     });
 
     let response = client
-        .post(format!("{}/v1/enroll", DEFAULT_BASE_URL))
+        .post(format!("{}/v1/enroll", super::endpoint::base_url()?))
         .header("x-nexus-enrollment-token", enrollment_token)
         .json(&body)
         .send()
@@ -316,7 +317,7 @@ pub async fn enroll(enrollment_token: &str, hardware_serial: &str) -> Result<Dev
 
 async fn authenticated_get(identity: &DeviceIdentity, path: &str) -> Result<ApiEnvelope> {
     let response = client()?
-        .get(format!("{}{}", DEFAULT_BASE_URL, path))
+        .get(format!("{}{}", super::endpoint::base_url()?, path))
         .header("x-nexus-device-id", &identity.device_id)
         .header("x-nexus-device-secret", &identity.device_secret)
         .send()
@@ -331,7 +332,7 @@ async fn authenticated_post(
     body: Value,
 ) -> Result<ApiEnvelope> {
     let response = client()?
-        .post(format!("{}{}", DEFAULT_BASE_URL, path))
+        .post(format!("{}{}", super::endpoint::base_url()?, path))
         .header("x-nexus-device-id", &identity.device_id)
         .header("x-nexus-device-secret", &identity.device_secret)
         .json(&body)
@@ -437,7 +438,11 @@ fn ensure_no_pending_rotation(identity: &DeviceIdentity) -> Result<()> {
     Ok(())
 }
 
-async fn rotate_device_credential(identity: &DeviceIdentity, command_id: &str) -> Result<()> {
+async fn rotate_device_credential(
+    identity: &DeviceIdentity,
+    command_id: &str,
+    rotation_journal: &CredentialRotationJournal,
+) -> Result<()> {
     // Refuse unsupported storage mode BEFORE requesting a replacement.
     crate::cloud::sa15m_live_identity_gate::enforce_legacy_mode(Path::new(identity_path()))?;
     ensure_no_pending_rotation(identity)?;
@@ -473,6 +478,13 @@ async fn rotate_device_credential(identity: &DeviceIdentity, command_id: &str) -
     //
     match finalize_pending_credential_rotation(&mut candidate).await {
         Ok(_) => {
+            // The rotation is finished on both sides, so its journal reservation is closed
+            // here. Previously only the startup-recovery path did this: after a rotation that
+            // completed on the first attempt the reservation stayed open and every later
+            // rotation was refused with "another credential rotation requires reconciliation".
+            if let Err(e) = rotation_journal.mark_completed(command_id) {
+                warn!(error = %e, "Credential rotation finalized but journal reconciliation failed");
+            }
             info!(
                 target: "nexus_cloud",
                 certificate_id = %certificate_id,
@@ -703,7 +715,9 @@ async fn handle_command(
         // Persist this identifier before contacting rotate/prepare.
         // A lost reply or process crash must never trigger another prepare.
         match rotation_journal.reserve(&command.id)? {
-            RotationReservation::New => rotate_device_credential(identity, &command.id).await?,
+            RotationReservation::New => {
+                rotate_device_credential(identity, &command.id, rotation_journal).await?
+            }
             RotationReservation::AlreadyReserved => {
                 warn!(command_id = %command.id, "Credential rotation requires reconciliation; refusing duplicate prepare");
             }
@@ -1691,6 +1705,20 @@ pub async fn run(db_path: &str, relay_tx: mpsc::Sender<RelayCommand>) {
         return;
     }
 
+    // A mis-set cloud address stops the cloud agent (never a silent fallback to another
+    // server); local access control is unaffected.
+    match super::endpoint::base_url() {
+        Ok(url) => info!(target: "nexus_cloud", cloud_url = %url, "Nexus cloud address"),
+        Err(e) => {
+            error!(error = %e, "Cloud address is not usable; cloud agent disabled, local access remains operational");
+            return;
+        }
+    }
+    if let Err(e) = super::endpoint::client() {
+        error!(error = %e, "Cloud connection settings are not usable; cloud agent disabled, local access remains operational");
+        return;
+    }
+
     let mut identity = match load_identity() {
         Ok(Some(identity)) => identity,
 
@@ -1854,9 +1882,44 @@ pub async fn run(db_path: &str, relay_tx: mpsc::Sender<RelayCommand>) {
 
     event_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
+    // Push stream: the server can say "there is work" between timer ticks. It only chooses
+    // which of the existing steps runs next; with no stream the timers below do everything.
+    let (nudge_tx, mut nudge_rx) = mpsc::channel::<super::endpoint::Nudge>(8);
+    let mut push_open = super::endpoint::push_enabled();
+    if push_open {
+        tokio::spawn(super::endpoint::run_stream(
+            identity.device_id.clone(),
+            identity.device_secret.clone(),
+            nudge_tx,
+        ));
+    } else {
+        info!(target: "nexus_cloud", "Push stream disabled by NEXUS_CLOUD_PUSH; using timed polling only");
+    }
+
+    enum Work {
+        Checkin,
+        Commands,
+        Events,
+    }
+
     loop {
-        tokio::select! {
-            _ = checkin_timer.tick() => {
+        let work = tokio::select! {
+            _ = checkin_timer.tick() => Work::Checkin,
+            _ = command_timer.tick() => Work::Commands,
+            _ = event_timer.tick() => Work::Events,
+            nudge = nudge_rx.recv(), if push_open => match nudge {
+                Some(super::endpoint::Nudge::Config) => Work::Checkin,
+                Some(super::endpoint::Nudge::Commands) => Work::Commands,
+                None => {
+                    // The stream task has ended; carry on with the timers alone.
+                    push_open = false;
+                    continue;
+                }
+            },
+        };
+
+        match work {
+            Work::Checkin => {
                 match checkin(&identity, &db).await {
                     Ok(data) => {
                         info!(
@@ -1888,7 +1951,7 @@ pub async fn run(db_path: &str, relay_tx: mpsc::Sender<RelayCommand>) {
                 }
             }
 
-            _ = command_timer.tick() => {
+            Work::Commands => {
                 if let Err(e) = flush_actuator_acks(&identity, &actuator_journal).await {
                     warn!(error = %e, "Deferred actuator acknowledgement failed");
                 }
@@ -1913,7 +1976,7 @@ pub async fn run(db_path: &str, relay_tx: mpsc::Sender<RelayCommand>) {
                 }
             }
 
-            _ = event_timer.tick() => {
+            Work::Events => {
                 if let Err(e) =
                     upload_events(
                         &identity,
@@ -2090,5 +2153,109 @@ mod credential_rotation_safety_tests {
     #[test]
     fn permits_rotation_when_no_pending_state() {
         assert!(ensure_no_pending_rotation(&example_identity()).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod live_server_tests {
+    //! Exercises this agent's own request code against a running cloud server.
+    //!
+    //! Ignored in a normal test run. To run it, start a server and set
+    //! `NEXUS_CLOUD_URL`, `NEXUS_TEST_DEVICE_ID` and `NEXUS_TEST_DEVICE_SECRET` for an enrolled
+    //! controller that has at least one command waiting, then:
+    //!
+    //! ```text
+    //! cargo test --bin highline-nexus-controller live_server -- --ignored --nocapture
+    //! ```
+    //!
+    //! It touches no hardware, no identity file and no local database.
+    use super::*;
+    use crate::cloud::endpoint::{Nudge, run_stream};
+
+    fn test_identity() -> DeviceIdentity {
+        let var = |name: &str| std::env::var(name).unwrap_or_else(|_| panic!("{name} must be set for the live test"));
+        DeviceIdentity {
+            device_id: var("NEXUS_TEST_DEVICE_ID"),
+            controller_id: "live-test".into(),
+            organization_id: "live-test".into(),
+            site_id: "live-test".into(),
+            device_secret: var("NEXUS_TEST_DEVICE_SECRET"),
+            hardware_profile: "HNX-HW-SP-ACP4WR6-R1".into(),
+            pending_certificate_id: None,
+            pending_rotation_command_id: None,
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a running server; see the module comment"]
+    async fn firmware_client_round_trip() {
+        let identity = test_identity();
+        println!("cloud address: {}", crate::cloud::endpoint::base_url().unwrap());
+
+        // Push stream: work already waiting is announced as soon as the stream opens.
+        let (tx, mut rx) = mpsc::channel(8);
+        let stream = tokio::spawn(run_stream(identity.device_id.clone(), identity.device_secret.clone(), tx));
+        let mut seen = Vec::new();
+        while seen.len() < 2 {
+            match tokio::time::timeout(Duration::from_secs(5), rx.recv()).await {
+                Ok(Some(nudge)) => seen.push(nudge),
+                _ => break,
+            }
+        }
+        println!("nudges received on the push stream: {seen:?}");
+        assert!(seen.contains(&Nudge::Commands), "expected a commands nudge, got {seen:?}");
+
+        // Check-in, in the shape this agent sends.
+        let checkin = authenticated_post(
+            &identity,
+            "/v1/checkin",
+            json!({
+                "software": { "agent_version": env!("CARGO_PKG_VERSION"), "firmware_version": "live-test" },
+                "configuration": { "applied_version": 0 }
+            }),
+        )
+        .await
+        .expect("check-in");
+        assert!(checkin.data["config_update_available"].is_boolean(), "check-in reply: {}", checkin.data);
+
+        // Configuration: the reply must have the shape this agent deserializes.
+        let config = authenticated_get(&identity, "/v1/config").await.expect("fetch configuration");
+        assert!(config.data["version"].as_u64().is_some(), "version must be an unsigned integer");
+        let parsed: CloudConfiguration =
+            serde_json::from_value(config.data["configuration"].clone()).expect("configuration shape");
+        println!(
+            "configuration v{} has {} doors and {} readers; local validation: {}",
+            config.data["version"],
+            parsed.doors.len(),
+            parsed.readers.len(),
+            match validate_cloud_configuration(&parsed) {
+                Ok(()) => "accepted".to_string(),
+                Err(e) => format!("rejected ({e})"),
+            }
+        );
+
+        // Commands: fetch, acknowledge, complete, exactly as the agent loop does.
+        let list = authenticated_get(&identity, "/v1/commands").await.expect("fetch commands");
+        let commands: CommandList = serde_json::from_value(list.data).expect("command list shape");
+        assert!(!commands.commands.is_empty(), "the test needs a command waiting");
+        for command in &commands.commands {
+            println!("command {} of type {}", command.id, command.command_type);
+            acknowledge_command(&identity, &command.id, "acknowledged", json!({}), None).await.expect("acknowledge");
+            acknowledge_command(&identity, &command.id, "completed", json!({ "message": "live test" }), None)
+                .await
+                .expect("complete");
+        }
+        // A command is handed over once only.
+        let again = authenticated_get(&identity, "/v1/commands").await.expect("fetch commands again");
+        let again: CommandList = serde_json::from_value(again.data).expect("command list shape");
+        assert!(again.commands.is_empty(), "commands were delivered twice");
+
+        // A wrong secret is reported with the server's error code, as the agent logs it.
+        let mut wrong = identity.clone();
+        wrong.device_secret = format!("HNXD_{}", "0".repeat(64));
+        let error = authenticated_get(&wrong, "/v1/commands").await.expect_err("wrong secret must fail");
+        assert!(error.to_string().starts_with("DEVICE_UNAUTHORIZED"), "unexpected error: {error}");
+
+        stream.abort();
     }
 }
