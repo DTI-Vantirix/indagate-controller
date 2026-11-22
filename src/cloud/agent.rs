@@ -670,9 +670,15 @@ async fn upload_events(identity: &DeviceIdentity, db: &ControllerDatabase) -> Re
             "rex_grant" | "rex_released" => "rex",
             "fire_active" => "input_active",
             "fire_cleared" | "fire_normal" => "input_restored",
+            "reader_tamper" => "tamper",
             "scheduled_unlock_active"
             | "scheduled_unlock_inactive"
             | "wiegand_invalid_frame"
+            | "reader_online"
+            | "reader_offline"
+            | "reader_tamper_restored"
+            | "reader_power_failure"
+            | "reader_power_restored"
             | "access_error"
             | "rex_error"
             | "rex_ignored" => "system",
