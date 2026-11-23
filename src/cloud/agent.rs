@@ -1991,7 +1991,9 @@ pub async fn run(db_path: &str, relay_tx: mpsc::Sender<RelayCommand>) {
 
     let mut command_timer = interval(Duration::from_secs(5));
 
-    let mut event_timer = interval(Duration::from_secs(5));
+    // Events go up within a second of happening, so screens show them as they occur.
+    // With nothing queued this is one local query and no request.
+    let mut event_timer = interval(Duration::from_secs(1));
 
     checkin_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
