@@ -39,7 +39,7 @@ use std::sync::mpsc::{Receiver, channel};
 use tracing::warn;
 
 use super::card_read::{CardRead, ReadSource};
-use super::reader_lights::{LightColor, ReaderLights};
+use super::reader_lights::{Blink, LightColor, ReaderLights};
 
 /// The longest card the controller will accept from a reader, as for Wiegand.
 const MAX_CARD_BITS: usize = 128;
@@ -163,19 +163,35 @@ fn osdp_color(color: LightColor) -> OsdpLedColor {
 
 /// The command that sets the light a reader rests on: steady, or flashing slowly. It
 /// leaves a result being shown at that moment alone; the reader returns to this after it.
-fn resting_command(color: LightColor, flashing: bool) -> OsdpCommandLed {
+fn resting_command(color: LightColor, blink: Blink) -> OsdpCommandLed {
+    // On and off times, in tenths of a second.
+    let (on, off) = match blink {
+        Blink::Steady => (10, 0),
+        Blink::Slow => (5, 5),
+        Blink::Fast => (2, 2),
+    };
     OsdpCommandLed {
         reader: 0,
         led_number: 0,
         temporary: OsdpLedParams::default(), // control code 0: leave the result being shown alone
         permanent: OsdpLedParams {
             control_code: 1, // set the permanent state
-            on_count: if flashing { 5 } else { 10 },
-            off_count: if flashing { 5 } else { 0 },
+            on_count: on,
+            off_count: off,
             on_color: osdp_color(color),
             off_color: OsdpLedColor::None,
             timer_count: 0,
         },
+    }
+}
+
+/// The buzzer command for a door alarm: short beeps that go on until told to stop
+/// (a repeat count of zero), or the command that stops them.
+fn sounder_command(sounding: bool) -> OsdpCommandBuzzer {
+    if sounding {
+        OsdpCommandBuzzer { reader: 0, control_code: 2, on_count: 2, off_count: 2, rep_count: 0 }
+    } else {
+        OsdpCommandBuzzer { reader: 0, control_code: 1, on_count: 0, off_count: 0, rep_count: 0 }
     }
 }
 
@@ -358,11 +374,19 @@ impl OsdpBus {
     }
 
     /// Set the light the reader on `channel` rests on between cards.
-    pub fn resting_light(&mut self, channel: u8, color: LightColor, flashing: bool) -> Result<()> {
+    pub fn resting_light(&mut self, channel: u8, color: LightColor, blink: Blink) -> Result<()> {
         let reader = self.channels.iter().position(|c| *c == channel).context("no such reader on this bus")?;
         self.panel
-            .send_command(reader as i32, OsdpCommand::Led(resting_command(color, flashing)))
+            .send_command(reader as i32, OsdpCommand::Led(resting_command(color, blink)))
             .map_err(|err| anyhow::anyhow!("the light command could not be sent: {err}"))
+    }
+
+    /// Start or stop the buzzer of the reader on `channel` sounding for a door alarm.
+    pub fn alarm_sounder(&mut self, channel: u8, sounding: bool) -> Result<()> {
+        let reader = self.channels.iter().position(|c| *c == channel).context("no such reader on this bus")?;
+        self.panel
+            .send_command(reader as i32, OsdpCommand::Buzzer(sounder_command(sounding)))
+            .map_err(|err| anyhow::anyhow!("the buzzer command could not be sent: {err}"))
     }
 
     /// The state of each reader's link.
@@ -522,6 +546,8 @@ impl Channel for SerialWire {
 const POLL_EVERY: std::time::Duration = std::time::Duration::from_millis(20);
 /// How often the reader settings are checked for a change.
 const SETTINGS_CHECK_EVERY: std::time::Duration = std::time::Duration::from_secs(3);
+/// How long an alarm's buzzer is left alone after a card, so the card's beeps are heard.
+const SOUNDER_RESUMES_AFTER: std::time::Duration = std::time::Duration::from_secs(2);
 /// How long to wait before sending a light command again after one could not go out.
 const LIGHT_RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(1);
 /// How long to wait before trying again after the bus could not be started.
@@ -607,19 +633,33 @@ pub async fn run(serial_port: &str, db_path: &str, relay_tx: tokio::sync::mpsc::
         // Each reader's door and light settings, the resting light it was last told to
         // show, and when a light command last failed to go out.
         let mut lights = db.osdp_reader_lights().unwrap_or_default();
-        let mut shown: Vec<Option<(LightColor, bool)>> = readers.iter().map(|_| None).collect();
+        let mut shown: Vec<Option<(LightColor, Blink)>> = readers.iter().map(|_| None).collect();
         let mut light_failed: Vec<Option<std::time::Instant>> = readers.iter().map(|_| None).collect();
+        // Whether each reader's buzzer was last told to sound for a door alarm, and until
+        // when it is left alone so the beeps for a card are heard.
+        let mut sounding: Vec<bool> = readers.iter().map(|_| false).collect();
+        let mut sounder_waits: Vec<Option<std::time::Instant>> = readers.iter().map(|_| None).collect();
         'bus: loop {
             for read in bus.poll() {
                 let channel = read.channel;
                 let outcome = super::card_read::handle(read, &db, &relay_tx).await;
                 bus.feedback(channel, feedback_for(outcome), lights.get(&channel).and_then(|(_, lights)| lights.as_ref()));
+                // The beeps for the card replace an alarm that was sounding; it starts
+                // again once they have been heard.
+                if let Some(index) = readers.iter().position(|reader| reader.channel == channel) {
+                    if sounding[index] {
+                        sounding[index] = false;
+                        sounder_waits[index] = Some(std::time::Instant::now() + SOUNDER_RESUMES_AFTER);
+                    }
+                }
             }
             for (index, link) in bus.links().into_iter().enumerate() {
                 // A reader going quiet or coming back is recorded as an event, once per change.
                 if let Some(name) = watches.entry(link.channel).or_default().link_event(link.online, std::time::Instant::now()) {
-                    // A reader that lost power has forgotten its light: tell it again.
+                    // A reader that lost power has forgotten its light and its buzzer:
+                    // tell it again.
                     shown[index] = None;
+                    sounding[index] = false;
                     tracing::info!(target: "indagate_osdp", reader = link.channel + 1, event = name, secure = link.secure, "OSDP reader link changed");
                     super::card_read::queue_event(
                         &db,
@@ -631,7 +671,26 @@ pub async fn run(serial_port: &str, db_path: &str, relay_tx: tokio::sync::mpsc::
                 let reader = &readers[index];
                 // The resting light follows the door: sent when it changes, not every round.
                 if let Some(&(door, Some(settings))) = lights.get(&link.channel) {
-                    let wanted = settings.resting(super::relay_worker::door_state(door));
+                    let alarm = super::door_alarm::door_alarm(door);
+                    let wanted = settings.resting(super::relay_worker::door_state(door), alarm);
+                    // The buzzer sounds for as long as the door is forced or held open.
+                    let sound = settings.sounds(alarm);
+                    if link.online
+                        && !reader.enrolling
+                        && sounding[index] != sound
+                        && sounder_waits[index].is_none_or(|until| std::time::Instant::now() >= until)
+                    {
+                        sounder_waits[index] = match bus.alarm_sounder(link.channel, sound) {
+                            Ok(()) => {
+                                sounding[index] = sound;
+                                None
+                            }
+                            Err(err) => {
+                                tracing::debug!(target: "indagate_osdp", reader = link.channel + 1, error = %err, "reader buzzer not set; will try again");
+                                Some(std::time::Instant::now() + LIGHT_RETRY_AFTER)
+                            }
+                        };
+                    }
                     if link.online
                         && !reader.enrolling
                         && shown[index] != Some(wanted)
@@ -755,9 +814,13 @@ pub async fn run(serial_port: &str, db_path: &str, relay_tx: tokio::sync::mpsc::
                         // Settings taken away: the light goes dark between cards, as it
                         // was before the controller started setting it.
                         if had && !has {
-                            let _ = bus.resting_light(reader.channel, LightColor::Off, false);
+                            let _ = bus.resting_light(reader.channel, LightColor::Off, Blink::Steady);
+                            if sounding[index] {
+                                let _ = bus.alarm_sounder(reader.channel, false);
+                            }
                         }
                         shown[index] = None;
+                        sounding[index] = false;
                     }
                     lights = now_lights;
                 }
@@ -1554,17 +1617,24 @@ mod tests {
 
     #[test]
     fn the_resting_light_is_permanent_and_leaves_a_result_alone() {
-        let steady = resting_command(LightColor::Red, false);
+        let steady = resting_command(LightColor::Red, Blink::Steady);
         assert_eq!(steady.temporary.control_code, 0);
         assert_eq!(steady.permanent.control_code, 1);
         assert_eq!(steady.permanent.on_color, OsdpLedColor::Red);
         assert_eq!(steady.permanent.off_count, 0, "steady: never off");
 
-        let flashing = resting_command(LightColor::Amber, true);
+        let flashing = resting_command(LightColor::Amber, Blink::Slow);
         assert_eq!((flashing.permanent.on_count, flashing.permanent.off_count), (5, 5));
         assert_eq!(flashing.permanent.off_color, OsdpLedColor::None);
+        let alarm = resting_command(LightColor::Red, Blink::Fast);
+        assert_eq!((alarm.permanent.on_count, alarm.permanent.off_count), (2, 2));
 
-        assert_eq!(resting_command(LightColor::Off, false).permanent.on_color, OsdpLedColor::None);
+        assert_eq!(resting_command(LightColor::Off, Blink::Steady).permanent.on_color, OsdpLedColor::None);
+
+        // An alarm's buzzer goes on until it is told to stop.
+        assert_eq!(sounder_command(true).rep_count, 0);
+        assert_eq!(sounder_command(true).control_code, 2);
+        assert_eq!(sounder_command(false).control_code, 1);
     }
 
     #[test]
