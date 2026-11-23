@@ -193,6 +193,16 @@ impl ControllerDatabase {
             )?;
         }
 
+        // How a door released by its request to exit relocks. Absent means timed.
+        let has_rex_relock = {
+            let mut stmt = self.conn.prepare("PRAGMA table_info(door_config)")?;
+            let columns = stmt.query_map([], |row| row.get::<_, String>(1))?;
+            columns.collect::<rusqlite::Result<Vec<String>>>()?.iter().any(|column| column == "rex_relock")
+        };
+        if !has_rex_relock {
+            self.conn.execute("ALTER TABLE door_config ADD COLUMN rex_relock TEXT", [])?;
+        }
+
         let mut has_holiday_behavior = false;
 
         {
@@ -469,6 +479,20 @@ impl ControllerDatabase {
             readers.insert(number - 1, (door, lights));
         }
         Ok(readers)
+    }
+
+    /// How a door released by its request to exit relocks (`timed`, `door_open`,
+    /// `door_closed`); `None` when nothing is set.
+    pub fn door_rex_relock(&self, channel: u8) -> Result<Option<String>> {
+        use rusqlite::OptionalExtension;
+
+        Ok(self
+            .conn
+            .query_row("SELECT rex_relock FROM door_config WHERE channel = ?1", [channel], |row| {
+                row.get::<_, Option<String>>(0)
+            })
+            .optional()?
+            .flatten())
     }
 
     pub fn door_unlock_ms(&self, channel: u8) -> Result<Option<u64>> {

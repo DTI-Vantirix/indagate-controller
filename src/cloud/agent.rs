@@ -119,6 +119,11 @@ struct CloudDoor {
 
     #[serde(default)]
     unlock_schedule_id: Option<String>,
+
+    /// How the door relocks after its request to exit released it: `timed`, `door_open`
+    /// or `door_closed`. Absent means timed.
+    #[serde(default)]
+    rex_relock: Option<String>,
 }
 
 // SA16Q READER POLICY V1: all reader authorization fields must arrive
@@ -1654,6 +1659,7 @@ fn apply_cloud_configuration(
                 enabled = ?3,
                 unlock_ms = ?4,
                 unlock_schedule_id = ?5,
+                rex_relock = ?6,
                 updated_at = CURRENT_TIMESTAMP
             WHERE channel = ?1
             "#,
@@ -1663,6 +1669,8 @@ fn apply_cloud_configuration(
                 if door.enabled { 1i64 } else { 0i64 },
                 door.unlock_ms as i64,
                 door.unlock_schedule_id,
+                // Stored as understood, so an unknown value cannot linger.
+                crate::hal::relay_worker::Relock::from_setting(door.rex_relock.as_deref()).name(),
             ],
         )?;
 
@@ -1983,7 +1991,9 @@ pub async fn run(db_path: &str, relay_tx: mpsc::Sender<RelayCommand>) {
 
     let mut command_timer = interval(Duration::from_secs(5));
 
-    let mut event_timer = interval(Duration::from_secs(5));
+    // Events go up within a second of happening, so screens show them as they occur.
+    // With nothing queued this is one local query and no request.
+    let mut event_timer = interval(Duration::from_secs(1));
 
     checkin_timer.set_missed_tick_behavior(MissedTickBehavior::Skip);
 

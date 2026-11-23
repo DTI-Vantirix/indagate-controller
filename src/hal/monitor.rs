@@ -12,7 +12,7 @@ use uuid::Uuid;
 use crate::storage::ControllerDatabase;
 
 use super::profile::{BoardProfile, GpioLine};
-use super::relay_worker::RelayCommand;
+use super::relay_worker::{RelayCommand, Relock};
 
 #[derive(Debug, Clone, Copy)]
 enum InputKind {
@@ -158,6 +158,9 @@ async fn process_initial_state(
 
             let event_type = if raw == 1 { "door_open" } else { "door_closed" };
 
+            // The relay worker follows the door for releases that relock with it.
+            let _ = relay_tx.send(RelayCommand::DoorContact { channel, open: raw == 1 }).await;
+
             queue_event(
                 db,
                 event_type,
@@ -242,6 +245,10 @@ async fn process_change(
             //
             let event_type = if raw == 1 { "door_open" } else { "door_closed" };
 
+            if let Err(e) = relay_tx.send(RelayCommand::DoorContact { channel, open: raw == 1 }).await {
+                error!(target: "indagate_door", channel = channel, error = %e, "Unable to tell the relay worker about the door");
+            }
+
             info!(
                 target: "indagate_door",
                 event = event_type,
@@ -279,11 +286,13 @@ async fn process_change(
             if rex_active {
                 match db.door_unlock_ms(channel) {
                     Ok(Some(duration_ms)) => {
+                        let relock = Relock::from_setting(db.door_rex_relock(channel).ok().flatten().as_deref());
+
                         match relay_tx
-                            .send(RelayCommand::Pulse {
+                            .send(RelayCommand::Release {
                                 channel,
                                 duration_ms,
-                                response: None,
+                                relock,
                             })
                             .await
                         {
@@ -304,7 +313,8 @@ async fn process_change(
                                         "channel": channel,
                                         "door": channel + 1,
                                         "raw": raw,
-                                        "unlock_ms": duration_ms
+                                        "unlock_ms": duration_ms,
+                                        "relock": relock.name()
                                     }),
                                 );
                             }
