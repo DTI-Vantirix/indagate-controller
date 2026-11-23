@@ -18,6 +18,20 @@ const REG_CONFIG: u8 = 0x03;
 
 const RELAY_MASK: u8 = 0b1111_0000;
 
+/// What to write before the relay lines can be driven directly: the output latch and the
+/// configuration register (PCA9534: 1 = input, 0 = output), or `None` when all four relay
+/// lines are outputs already and nothing may be touched.
+///
+/// Only the latches of lines that are still inputs are cleared. Bits 0-3 and the latches
+/// of relay lines that are already outputs are preserved.
+fn direct_output_setup(config: u8, output: u8) -> Option<(u8, u8)> {
+    let still_inputs = config & RELAY_MASK;
+    if still_inputs == 0 {
+        return None;
+    }
+    Some((output & !still_inputs, config & !RELAY_MASK))
+}
+
 #[derive(Debug, Clone, Copy, Serialize)]
 pub enum RelayBackend {
     GpioCdev,
@@ -207,34 +221,28 @@ impl RelayController {
         let config = self.direct_read_register(REG_CONFIG)?;
         let output = self.direct_read_register(REG_OUTPUT)?;
 
-        // SAFETY:
-        // Set relay output latches LOW before changing pins 4-7
-        // from inputs to outputs. This prevents all relay lines
-        // from becoming active if the power-on output latch is 0xFF.
-        //
-        // Preserve bits 0-3 exactly as they are.
-        let safe_output = output & !RELAY_MASK;
+        // Relay lines that are already outputs are left exactly as they are: a relay
+        // that is on for one door must not be touched because another door's relay is
+        // being set.
+        let Some((safe_output, new_config)) = direct_output_setup(config, output) else {
+            return Ok(());
+        };
+        let becoming_outputs = config & RELAY_MASK;
 
+        // SAFETY:
+        // Set the output latch LOW for each relay line that is still an input, before
+        // making it an output. This prevents a relay from switching on if the power-on
+        // output latch is 0xFF.
         if safe_output != output {
             self.direct_write_register(REG_OUTPUT, safe_output)?;
         }
 
-        // PCA9534 config:
-        // 1 = input
-        // 0 = output
-        //
-        // Preserve configuration bits 0-3.
-        // Force relay lines 4-7 to outputs.
-        let new_config = config & !RELAY_MASK;
+        self.direct_write_register(REG_CONFIG, new_config)?;
 
-        if new_config != config {
-            self.direct_write_register(REG_CONFIG, new_config)?;
-        }
-
-        // Verify relay outputs remain LOW after direction change.
+        // Verify the lines just made outputs are LOW.
         let verify_output = self.direct_read_register(REG_OUTPUT)?;
 
-        if (verify_output & RELAY_MASK) != 0 {
+        if (verify_output & becoming_outputs) != 0 {
             return Err(anyhow!(
                 "unsafe relay initialization: relay bits not low: output=0x{:02x}",
                 verify_output
@@ -337,5 +345,26 @@ impl RelayController {
             self.direct_read_register(REG_POLARITY)?,
             self.direct_read_register(REG_CONFIG)?,
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn relays_that_are_already_on_are_left_alone() {
+        // All four relay lines are outputs, relay 1 is on: setting another relay must
+        // not clear it.
+        assert_eq!(direct_output_setup(0b0000_1111, 0b0001_0000), None);
+        assert_eq!(direct_output_setup(0b0000_0000, 0b1111_0000), None);
+    }
+
+    #[test]
+    fn lines_still_inputs_are_made_outputs_with_their_latch_low() {
+        // Power-on: everything an input, latches high.
+        assert_eq!(direct_output_setup(0xFF, 0xFF), Some((0b0000_1111, 0b0000_1111)));
+        // Only relay 4's line is still an input; relay 1 is on and stays on.
+        assert_eq!(direct_output_setup(0b1000_0011, 0b1001_0101), Some((0b0001_0101, 0b0000_0011)));
     }
 }

@@ -42,12 +42,80 @@ impl Default for PersistedOverrideFile {
     }
 }
 
+/// When a door released by its request-to-exit input locks again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Relock {
+    /// When the unlock time runs out.
+    #[default]
+    Timed,
+    /// As soon as the door contact shows the door open, or when the time runs out.
+    DoorOpen,
+    /// When the door has been opened and closed again. A door that is never opened locks
+    /// when the time runs out; one left open stays released until it closes.
+    DoorClosed,
+}
+
+impl Relock {
+    /// The setting as the server sends it. Anything unknown is the timed relock.
+    pub fn from_setting(setting: Option<&str>) -> Self {
+        match setting {
+            Some("door_open") => Relock::DoorOpen,
+            Some("door_closed") => Relock::DoorClosed,
+            _ => Relock::Timed,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Relock::Timed => "timed",
+            Relock::DoorOpen => "door_open",
+            Relock::DoorClosed => "door_closed",
+        }
+    }
+}
+
+/// What a change of a door's contact does to a release that is in progress.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContactEffect {
+    Nothing,
+    /// Lock now.
+    Relock,
+    /// Stay released until the door closes, whatever the time.
+    WaitForClose,
+}
+
+fn contact_effect(relock: Relock, open: bool, waiting_for_close: bool) -> ContactEffect {
+    match (relock, open) {
+        (Relock::DoorOpen, true) => ContactEffect::Relock,
+        (Relock::DoorClosed, true) => ContactEffect::WaitForClose,
+        (Relock::DoorClosed, false) if waiting_for_close => ContactEffect::Relock,
+        _ => ContactEffect::Nothing,
+    }
+}
+
 #[derive(Debug)]
 pub enum RelayCommand {
     Pulse {
         channel: u8,
         duration_ms: u64,
         response: Option<oneshot::Sender<Result<(), String>>>,
+    },
+
+    //
+    // A request to exit: a pulse that may end early, or late, with the door.
+    //
+    Release {
+        channel: u8,
+        duration_ms: u64,
+        relock: Relock,
+    },
+
+    //
+    // The door contact changed (or its state at start-up).
+    //
+    DoorContact {
+        channel: u8,
+        open: bool,
     },
 
     //
@@ -283,6 +351,14 @@ pub async fn run(mut receiver: mpsc::Receiver<RelayCommand>) {
 
     let mut fire_active = false;
 
+    //
+    // How each door's current pulse relocks, whether each door is open, and
+    // whether a pulse is being held until its door closes.
+    //
+    let mut relock_modes = [Relock::Timed; 4];
+    let mut door_open = [false; 4];
+    let mut waiting_for_close = [false; 4];
+
     let mut ticker = interval(Duration::from_millis(50));
 
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
@@ -331,7 +407,54 @@ pub async fn run(mut receiver: mpsc::Receiver<RelayCommand>) {
                     return;
                 };
 
+                //
+                // A request to exit is a pulse with a relock rule.
+                //
+                let (command, pulse_relock) = match command {
+                    RelayCommand::Release { channel, duration_ms, relock } => {
+                        (RelayCommand::Pulse { channel, duration_ms, response: None }, relock)
+                    }
+                    other => (other, Relock::Timed),
+                };
+
                 match command {
+                    RelayCommand::Release { .. } => {}
+
+                    RelayCommand::DoorContact { channel, open } => {
+                        if !valid_channel(channel) {
+                            continue;
+                        }
+                        let index = channel as usize;
+                        door_open[index] = open;
+
+                        // Only a pulse in progress is affected. Fire has already
+                        // cancelled any pulse.
+                        if deadlines[index].is_none() {
+                            continue;
+                        }
+                        match contact_effect(relock_modes[index], open, waiting_for_close[index]) {
+                            ContactEffect::Nothing => {}
+                            ContactEffect::WaitForClose => {
+                                waiting_for_close[index] = true;
+                                info!(
+                                    target: "indagate_relay",
+                                    channel = channel,
+                                    "Door opened; relay stays on until it closes"
+                                );
+                            }
+                            ContactEffect::Relock => {
+                                // The next tick completes the pulse the usual way.
+                                waiting_for_close[index] = false;
+                                deadlines[index] = Some(Instant::now());
+                                info!(
+                                    target: "indagate_relay",
+                                    channel = channel,
+                                    door_open = open,
+                                    "Door contact ends the relay pulse"
+                                );
+                            }
+                        }
+                    }
                     RelayCommand::FireOverride {
                         active,
                     } => {
@@ -563,6 +686,12 @@ pub async fn run(mut receiver: mpsc::Receiver<RelayCommand>) {
                                             duration_ms,
                                         ),
                                 );
+
+                                relock_modes[channel as usize] = pulse_relock;
+                                // A door that is already open when it is released
+                                // counts as opened.
+                                waiting_for_close[channel as usize] =
+                                    pulse_relock == Relock::DoorClosed && door_open[channel as usize];
 
                                 info!(
                                     target: "indagate_relay",
@@ -1100,6 +1229,13 @@ pub async fn run(mut receiver: mpsc::Receiver<RelayCommand>) {
                         continue;
                     }
 
+                    //
+                    // Held until the door closes: the contact ends it.
+                    //
+                    if waiting_for_close[channel as usize] {
+                        continue;
+                    }
+
                     let desired =
                         desired_physical_state(
                             channel,
@@ -1163,6 +1299,31 @@ mod tests {
         // A fire alarm reverses the relay; the state is what the door then does.
         assert_eq!(door_state_of(true, false, Some(DoorOverrideMode::ForceLocked), false), DoorState::HeldUnlocked);
         assert_eq!(door_state_of(true, true, None, false), DoorState::Locked);
+    }
+
+    #[test]
+    fn a_release_relocks_as_its_door_setting_says() {
+        // Timed: the contact changes nothing.
+        assert_eq!(contact_effect(Relock::Timed, true, false), ContactEffect::Nothing);
+        assert_eq!(contact_effect(Relock::Timed, false, false), ContactEffect::Nothing);
+        // On door open: locks the moment the door opens.
+        assert_eq!(contact_effect(Relock::DoorOpen, true, false), ContactEffect::Relock);
+        assert_eq!(contact_effect(Relock::DoorOpen, false, false), ContactEffect::Nothing);
+        // On door closed: waits for the door once it has opened, then locks when it closes.
+        assert_eq!(contact_effect(Relock::DoorClosed, true, false), ContactEffect::WaitForClose);
+        assert_eq!(contact_effect(Relock::DoorClosed, false, true), ContactEffect::Relock);
+        // Closed without having opened: nothing.
+        assert_eq!(contact_effect(Relock::DoorClosed, false, false), ContactEffect::Nothing);
+    }
+
+    #[test]
+    fn the_relock_setting_is_read_as_sent() {
+        assert_eq!(Relock::from_setting(None), Relock::Timed);
+        assert_eq!(Relock::from_setting(Some("timed")), Relock::Timed);
+        assert_eq!(Relock::from_setting(Some("door_open")), Relock::DoorOpen);
+        assert_eq!(Relock::from_setting(Some("door_closed")), Relock::DoorClosed);
+        assert_eq!(Relock::from_setting(Some("something else")), Relock::Timed);
+        assert_eq!(Relock::from_setting(Some(Relock::DoorClosed.name())), Relock::DoorClosed);
     }
 
     #[test]
