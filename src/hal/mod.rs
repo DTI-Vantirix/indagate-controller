@@ -4,6 +4,7 @@ pub mod input;
 pub mod monitor;
 pub mod osdp;
 pub mod profile;
+pub mod reader_lights;
 pub mod relay;
 pub mod relay_worker;
 pub mod wiegand;
