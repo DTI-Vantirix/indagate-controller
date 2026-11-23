@@ -205,6 +205,9 @@ fn reader_link(r: &CloudReader, pins: ((&str, u64), (&str, u64))) -> Result<Read
                 .filter(|b| OSDP_BAUD_RATES.contains(b))
                 .ok_or_else(|| anyhow!("OSDP reader line speed is not one this controller supports"))?,
         };
+        // Light settings that cannot be read refuse the configuration here, before any of
+        // it is applied.
+        crate::hal::reader_lights::ReaderLights::from_configuration(&r.configuration)?;
         return Ok(ReaderLink::Osdp { address, baud_rate, secure: r.osdp_secure_channel == Some(true) });
     }
     Err(anyhow!("SA16Q reader identity, commissioning or mapping invalid"))
@@ -1468,14 +1471,21 @@ fn apply_cloud_configuration(
                 (Some(i64::from(address)), Some(i64::from(baud_rate)), i64::from(secure))
             }
         };
+        // Light settings apply to OSDP readers only; a Wiegand reader's are not kept.
+        let lights = match link {
+            ReaderLink::Wiegand => None,
+            ReaderLink::Osdp { .. } => crate::hal::reader_lights::ReaderLights::from_configuration(&reader.configuration)?
+                .map(|lights| serde_json::to_string(&lights))
+                .transpose()?,
+        };
         tx.execute(
-            "INSERT INTO reader_config(reader_number,reader_id,enabled,door_channel,protocol,osdp_address,osdp_baud_rate,osdp_secure)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+            "INSERT INTO reader_config(reader_number,reader_id,enabled,door_channel,protocol,osdp_address,osdp_baud_rate,osdp_secure,lights)
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)",
             rusqlite::params![
                 i64::from(reader.reader_number), &reader.id,
                 if reader.enabled == Some(true) { 1i64 } else { 0i64 },
                 i64::from(reader.door_channel.ok_or_else(|| anyhow!("reader missing door channel"))?),
-                link.protocol(), osdp_address, osdp_baud_rate, osdp_secure,
+                link.protocol(), osdp_address, osdp_baud_rate, osdp_secure, lights,
             ],
         )?;
     }
@@ -2169,6 +2179,9 @@ mod reader_link_tests {
         assert!(reader_link(&reader(osdp(json!(7), json!({}))), PORT_ONE).is_err());
         assert!(reader_link(&reader(osdp(json!(7), json!({ "transport": "rs485", "baud_rate": 1200 }))), PORT_ONE).is_err());
         assert!(reader_link(&reader(osdp(json!(7), json!({ "transport": "rs485", "baud_rate": "fast" }))), PORT_ONE).is_err());
+        // Light settings are checked with the rest.
+        assert!(reader_link(&reader(osdp(json!(7), json!({ "transport": "rs485", "lights": { "locked": "red" } }))), PORT_ONE).is_ok());
+        assert!(reader_link(&reader(osdp(json!(7), json!({ "transport": "rs485", "lights": { "locked": "purple" } }))), PORT_ONE).is_err());
     }
 
     #[test]

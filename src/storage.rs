@@ -226,6 +226,7 @@ impl ControllerDatabase {
             ("osdp_address", "INTEGER"),
             ("osdp_baud_rate", "INTEGER"),
             ("osdp_secure", "INTEGER NOT NULL DEFAULT 0"),
+            ("lights", "TEXT"),
         ] {
             if !reader_columns.iter().any(|existing| existing == column) {
                 self.conn.execute(&format!("ALTER TABLE reader_config ADD COLUMN {column} {definition}"), [])?;
@@ -442,6 +443,30 @@ impl ControllerDatabase {
             }
             let baud_rate = baud_rate.and_then(|b| u32::try_from(b).ok()).unwrap_or(9600);
             readers.push((number - 1, address, baud_rate, secure != 0));
+        }
+        Ok(readers)
+    }
+
+    /// For each enabled OSDP reader port (channel): the door it stands at, and its light
+    /// settings if it has any. Settings that cannot be read count as none.
+    pub fn osdp_reader_lights(
+        &self,
+    ) -> Result<std::collections::HashMap<u8, (u8, Option<crate::hal::reader_lights::ReaderLights>)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT reader_number, door_channel, lights FROM reader_config WHERE protocol = 'osdp' AND enabled = 1",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, Option<String>>(2)?))
+        })?;
+        let mut readers = std::collections::HashMap::new();
+        for row in rows {
+            let (number, door, lights) = row?;
+            let (Ok(number), Ok(door)) = (u8::try_from(number), u8::try_from(door)) else { continue };
+            if !(1..=4).contains(&number) || door > 3 {
+                continue;
+            }
+            let lights = lights.and_then(|text| serde_json::from_str(&text).ok());
+            readers.insert(number - 1, (door, lights));
         }
         Ok(readers)
     }

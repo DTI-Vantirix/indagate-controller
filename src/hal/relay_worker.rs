@@ -193,6 +193,69 @@ fn desired_physical_state(
     if fire_active { !normal } else { normal }
 }
 
+/// What a door is doing, for anything that shows it (a reader's light).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DoorState {
+    Locked,
+    /// Released for a moment: a granted card, a request to exit or a remote unlock.
+    Unlocking,
+    /// Held unlocked by a schedule or an operator.
+    HeldUnlocked,
+    /// Locked down by an operator: cards do not open it.
+    ForcedLocked,
+}
+
+/// The state of each door as the relay worker last left it. Locked until it has run.
+static DOOR_STATES: [std::sync::atomic::AtomicU8; 4] = [const { std::sync::atomic::AtomicU8::new(0) }; 4];
+
+/// What door `channel` is doing right now.
+pub fn door_state(channel: u8) -> DoorState {
+    match DOOR_STATES.get(usize::from(channel)).map(|state| state.load(std::sync::atomic::Ordering::Relaxed)) {
+        Some(1) => DoorState::Unlocking,
+        Some(2) => DoorState::HeldUnlocked,
+        Some(3) => DoorState::ForcedLocked,
+        _ => DoorState::Locked,
+    }
+}
+
+/// A door's state from what the worker holds. During a fire alarm the relay is the
+/// reverse of its normal state, and the light shows what the door is actually doing.
+fn door_state_of(fire_active: bool, normal_unlocked: bool, mode: Option<DoorOverrideMode>, pulse_active: bool) -> DoorState {
+    if fire_active {
+        return if normal_unlocked { DoorState::Locked } else { DoorState::HeldUnlocked };
+    }
+    match mode {
+        Some(DoorOverrideMode::ForceLocked) => DoorState::ForcedLocked,
+        _ if normal_unlocked => DoorState::HeldUnlocked,
+        _ if pulse_active => DoorState::Unlocking,
+        _ => DoorState::Locked,
+    }
+}
+
+fn publish_door_states(
+    fire_active: bool,
+    schedule_state: &[bool; 4],
+    overrides: &PersistedOverrideFile,
+    deadlines: &[Option<Instant>; 4],
+) {
+    for channel in 0u8..4 {
+        let index = usize::from(channel);
+        let state = door_state_of(
+            fire_active,
+            effective_normal_state(channel, schedule_state, overrides),
+            overrides.doors[index].as_ref().map(|entry| entry.mode),
+            deadlines[index].is_some(),
+        );
+        let code = match state {
+            DoorState::Locked => 0,
+            DoorState::Unlocking => 1,
+            DoorState::HeldUnlocked => 2,
+            DoorState::ForcedLocked => 3,
+        };
+        DOOR_STATES[index].store(code, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 fn override_expired(entry: &PersistedDoorOverride) -> bool {
     entry
         .expires_at
@@ -236,6 +299,10 @@ pub async fn run(mut receiver: mpsc::Receiver<RelayCommand>) {
     //
 
     loop {
+        // Every command and every tick comes back through here, so this is never more
+        // than one tick behind the relays.
+        publish_door_states(fire_active, &schedule_state, &overrides, &deadlines);
+
         tokio::select! {
             command = receiver.recv() => {
                 let Some(command) = command else {
@@ -1077,5 +1144,29 @@ pub async fn run(mut receiver: mpsc::Receiver<RelayCommand>) {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_door_state_is_what_the_door_is_doing() {
+        assert_eq!(door_state_of(false, false, None, false), DoorState::Locked);
+        assert_eq!(door_state_of(false, false, None, true), DoorState::Unlocking);
+        // Held unlocked by its schedule or by an operator.
+        assert_eq!(door_state_of(false, true, None, false), DoorState::HeldUnlocked);
+        assert_eq!(door_state_of(false, true, Some(DoorOverrideMode::HoldUnlocked), true), DoorState::HeldUnlocked);
+        // Locked down wins over everything but a fire alarm.
+        assert_eq!(door_state_of(false, false, Some(DoorOverrideMode::ForceLocked), true), DoorState::ForcedLocked);
+        // A fire alarm reverses the relay; the state is what the door then does.
+        assert_eq!(door_state_of(true, false, Some(DoorOverrideMode::ForceLocked), false), DoorState::HeldUnlocked);
+        assert_eq!(door_state_of(true, true, None, false), DoorState::Locked);
+    }
+
+    #[test]
+    fn a_door_nobody_has_reported_on_is_locked() {
+        assert_eq!(door_state(9), DoorState::Locked);
     }
 }

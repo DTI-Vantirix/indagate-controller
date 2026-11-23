@@ -39,6 +39,7 @@ use std::sync::mpsc::{Receiver, channel};
 use tracing::warn;
 
 use super::card_read::{CardRead, ReadSource};
+use super::reader_lights::{LightColor, ReaderLights};
 
 /// The longest card the controller will accept from a reader, as for Wiegand.
 const MAX_CARD_BITS: usize = 128;
@@ -132,10 +133,57 @@ pub struct ReaderStatus {
 /// The light and buzzer commands for `feedback`. Both are temporary: the reader returns
 /// to its own idle state afterwards, so nothing here has to know what that is.
 fn feedback_commands(feedback: Feedback) -> (OsdpCommandLed, OsdpCommandBuzzer) {
+    feedback_in(feedback, OsdpLedColor::Green, OsdpLedColor::Red)
+}
+
+/// The same, as a reader's light settings want it: their colours, and no command at all
+/// for a light set to off or a buzzer set to stay quiet.
+fn feedback_with(feedback: Feedback, lights: Option<&ReaderLights>) -> (Option<OsdpCommandLed>, Option<OsdpCommandBuzzer>) {
+    let Some(lights) = lights else {
+        let (led, buzzer) = feedback_commands(feedback);
+        return (Some(led), Some(buzzer));
+    };
+    let (led, buzzer) = feedback_in(feedback, osdp_color(lights.granted), osdp_color(lights.denied));
+    let (color, beep) = match feedback {
+        Feedback::Granted => (lights.granted, lights.beep_granted),
+        Feedback::Denied => (lights.denied, lights.beep_denied),
+    };
+    ((color != LightColor::Off).then_some(led), beep.then_some(buzzer))
+}
+
+fn osdp_color(color: LightColor) -> OsdpLedColor {
+    match color {
+        LightColor::Off => OsdpLedColor::None,
+        LightColor::Red => OsdpLedColor::Red,
+        LightColor::Green => OsdpLedColor::Green,
+        LightColor::Amber => OsdpLedColor::Amber,
+        LightColor::Blue => OsdpLedColor::Blue,
+    }
+}
+
+/// The command that sets the light a reader rests on: steady, or flashing slowly. It
+/// leaves a result being shown at that moment alone; the reader returns to this after it.
+fn resting_command(color: LightColor, flashing: bool) -> OsdpCommandLed {
+    OsdpCommandLed {
+        reader: 0,
+        led_number: 0,
+        temporary: OsdpLedParams::default(), // control code 0: leave the result being shown alone
+        permanent: OsdpLedParams {
+            control_code: 1, // set the permanent state
+            on_count: if flashing { 5 } else { 10 },
+            off_count: if flashing { 5 } else { 0 },
+            on_color: osdp_color(color),
+            off_color: OsdpLedColor::None,
+            timer_count: 0,
+        },
+    }
+}
+
+fn feedback_in(feedback: Feedback, granted: OsdpLedColor, denied: OsdpLedColor) -> (OsdpCommandLed, OsdpCommandBuzzer) {
     // Durations are in tenths of a second.
     let (color, on, off, total, beeps, beep_on, beep_off) = match feedback {
-        Feedback::Granted => (OsdpLedColor::Green, 10, 0, 10, 1, 2, 1),
-        Feedback::Denied => (OsdpLedColor::Red, 1, 1, 6, 3, 1, 1),
+        Feedback::Granted => (granted, 10, 0, 10, 1, 2, 1),
+        Feedback::Denied => (denied, 1, 1, 6, 3, 1, 1),
     };
     let led = OsdpCommandLed {
         reader: 0,
@@ -298,14 +346,23 @@ impl OsdpBus {
     /// Show and sound the result of a card read at the reader on `channel`. A reader with
     /// no light or no buzzer simply does not get that half; neither failure matters to
     /// the decision, which has already been made.
-    pub fn feedback(&mut self, channel: u8, feedback: Feedback) {
+    pub fn feedback(&mut self, channel: u8, feedback: Feedback, lights: Option<&ReaderLights>) {
         let Some(reader) = self.channels.iter().position(|c| *c == channel) else { return };
-        let (led, buzzer) = feedback_commands(feedback);
-        for (what, command) in [("light", OsdpCommand::Led(led)), ("buzzer", OsdpCommand::Buzzer(buzzer))] {
+        let (led, buzzer) = feedback_with(feedback, lights);
+        for (what, command) in [("light", led.map(OsdpCommand::Led)), ("buzzer", buzzer.map(OsdpCommand::Buzzer))] {
+            let Some(command) = command else { continue };
             if let Err(err) = self.panel.send_command(reader as i32, command) {
                 tracing::debug!(target: "indagate_osdp", reader = channel + 1, what, error = %err, "reader feedback not sent");
             }
         }
+    }
+
+    /// Set the light the reader on `channel` rests on between cards.
+    pub fn resting_light(&mut self, channel: u8, color: LightColor, flashing: bool) -> Result<()> {
+        let reader = self.channels.iter().position(|c| *c == channel).context("no such reader on this bus")?;
+        self.panel
+            .send_command(reader as i32, OsdpCommand::Led(resting_command(color, flashing)))
+            .map_err(|err| anyhow::anyhow!("the light command could not be sent: {err}"))
     }
 
     /// The state of each reader's link.
@@ -465,6 +522,8 @@ impl Channel for SerialWire {
 const POLL_EVERY: std::time::Duration = std::time::Duration::from_millis(20);
 /// How often the reader settings are checked for a change.
 const SETTINGS_CHECK_EVERY: std::time::Duration = std::time::Duration::from_secs(3);
+/// How long to wait before sending a light command again after one could not go out.
+const LIGHT_RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(1);
 /// How long to wait before trying again after the bus could not be started.
 const RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(10);
 
@@ -540,15 +599,22 @@ pub async fn run(serial_port: &str, db_path: &str, relay_tx: tokio::sync::mpsc::
         let mut secure_since: Vec<Option<std::time::Instant>> = readers.iter().map(|_| None).collect();
         let mut key_sent_at: Vec<Option<std::time::Instant>> = readers.iter().map(|_| None).collect();
         let mut settings_checked = std::time::Instant::now();
+        // Each reader's door and light settings, the resting light it was last told to
+        // show, and when a light command last failed to go out.
+        let mut lights = db.osdp_reader_lights().unwrap_or_default();
+        let mut shown: Vec<Option<(LightColor, bool)>> = readers.iter().map(|_| None).collect();
+        let mut light_failed: Vec<Option<std::time::Instant>> = readers.iter().map(|_| None).collect();
         'bus: loop {
             for read in bus.poll() {
                 let channel = read.channel;
                 let outcome = super::card_read::handle(read, &db, &relay_tx).await;
-                bus.feedback(channel, feedback_for(outcome));
+                bus.feedback(channel, feedback_for(outcome), lights.get(&channel).and_then(|(_, lights)| lights.as_ref()));
             }
             for (index, link) in bus.links().into_iter().enumerate() {
                 // A reader going quiet or coming back is recorded as an event, once per change.
                 if let Some(name) = watches[index].link_event(link.online, started.elapsed()) {
+                    // A reader that lost power has forgotten its light: tell it again.
+                    shown[index] = None;
                     tracing::info!(target: "indagate_osdp", reader = link.channel + 1, event = name, secure = link.secure, "OSDP reader link changed");
                     super::card_read::queue_event(
                         &db,
@@ -558,6 +624,26 @@ pub async fn run(serial_port: &str, db_path: &str, relay_tx: tokio::sync::mpsc::
                     );
                 }
                 let reader = &readers[index];
+                // The resting light follows the door: sent when it changes, not every round.
+                if let Some(&(door, Some(settings))) = lights.get(&link.channel) {
+                    let wanted = settings.resting(super::relay_worker::door_state(door));
+                    if link.online
+                        && !reader.enrolling
+                        && shown[index] != Some(wanted)
+                        && light_failed[index].is_none_or(|at| at.elapsed() >= LIGHT_RETRY_AFTER)
+                    {
+                        match bus.resting_light(link.channel, wanted.0, wanted.1) {
+                            Ok(()) => {
+                                shown[index] = Some(wanted);
+                                light_failed[index] = None;
+                            }
+                            Err(err) => {
+                                tracing::debug!(target: "indagate_osdp", reader = link.channel + 1, error = %err, "reader light not set; will try again");
+                                light_failed[index] = Some(std::time::Instant::now());
+                            }
+                        }
+                    }
+                }
                 let held = if link.secure {
                     Some(secure_since[index].get_or_insert_with(std::time::Instant::now).elapsed())
                 } else {
@@ -640,6 +726,21 @@ pub async fn run(serial_port: &str, db_path: &str, relay_tx: tokio::sync::mpsc::
                 }
                 if !expire_key_changes_pending(&db, chrono::Utc::now()).is_empty() {
                     break;
+                }
+                // Light settings change without restarting the bus.
+                let now_lights = db.osdp_reader_lights().unwrap_or_default();
+                if now_lights != lights {
+                    for (index, reader) in readers.iter().enumerate() {
+                        let had = lights.get(&reader.channel).is_some_and(|(_, lights)| lights.is_some());
+                        let has = now_lights.get(&reader.channel).is_some_and(|(_, lights)| lights.is_some());
+                        // Settings taken away: the light goes dark between cards, as it
+                        // was before the controller started setting it.
+                        if had && !has {
+                            let _ = bus.resting_light(reader.channel, LightColor::Off, false);
+                        }
+                        shown[index] = None;
+                    }
+                    lights = now_lights;
                 }
             }
             tokio::time::sleep(POLL_EVERY).await;
@@ -1397,6 +1498,67 @@ mod tests {
     }
 
     #[test]
+    fn light_settings_choose_the_colours_and_the_beeps() {
+        let lights: ReaderLights = serde_json::from_value(serde_json::json!({
+            "granted": "blue", "denied": "amber", "beep_granted": false
+        }))
+        .unwrap();
+        let (led, buzzer) = feedback_with(Feedback::Granted, Some(&lights));
+        assert_eq!(led.unwrap().temporary.on_color, OsdpLedColor::Blue);
+        assert!(buzzer.is_none(), "the buzzer stays quiet on a grant");
+        let (led, buzzer) = feedback_with(Feedback::Denied, Some(&lights));
+        assert_eq!(led.unwrap().temporary.on_color, OsdpLedColor::Amber);
+        assert!(buzzer.is_some());
+
+        // A light set to off gets no command at all.
+        let dark: ReaderLights = serde_json::from_value(serde_json::json!({ "denied": "off" })).unwrap();
+        assert!(feedback_with(Feedback::Denied, Some(&dark)).0.is_none());
+
+        // Without settings a reader gets what it always got.
+        let (led, buzzer) = feedback_commands(Feedback::Granted);
+        assert_eq!(feedback_with(Feedback::Granted, None), (Some(led), Some(buzzer)));
+    }
+
+    #[test]
+    fn the_resting_light_is_permanent_and_leaves_a_result_alone() {
+        let steady = resting_command(LightColor::Red, false);
+        assert_eq!(steady.temporary.control_code, 0);
+        assert_eq!(steady.permanent.control_code, 1);
+        assert_eq!(steady.permanent.on_color, OsdpLedColor::Red);
+        assert_eq!(steady.permanent.off_count, 0, "steady: never off");
+
+        let flashing = resting_command(LightColor::Amber, true);
+        assert_eq!((flashing.permanent.on_count, flashing.permanent.off_count), (5, 5));
+        assert_eq!(flashing.permanent.off_color, OsdpLedColor::None);
+
+        assert_eq!(resting_command(LightColor::Off, false).permanent.on_color, OsdpLedColor::None);
+    }
+
+    #[test]
+    fn light_settings_are_kept_per_osdp_reader() {
+        let db = ControllerDatabase::open(":memory:").unwrap();
+        db.connection()
+            .execute_batch(
+                r#"
+                INSERT INTO reader_config (reader_number, reader_id, enabled, door_channel, protocol, osdp_address, lights)
+                    VALUES (1, 'reader1', 1, 2, 'osdp', 1, '{"locked":"red","unlocked":"green","granted":"green","denied":"red","lockdown":"amber","beep_granted":true,"beep_denied":false}');
+                INSERT INTO reader_config (reader_number, reader_id, enabled, door_channel, protocol, osdp_address)
+                    VALUES (2, 'reader2', 1, 1, 'osdp', 2);
+                INSERT INTO reader_config (reader_number, reader_id, enabled, door_channel) VALUES (3, 'reader3', 1, 3);
+                "#,
+            )
+            .unwrap();
+        let lights = db.osdp_reader_lights().unwrap();
+        assert_eq!(lights.len(), 2, "the Wiegand reader is not listed");
+        let (door, settings) = lights[&0];
+        assert_eq!(door, 2);
+        let settings = settings.unwrap();
+        assert_eq!(settings.lockdown, LightColor::Amber);
+        assert!(!settings.beep_denied);
+        assert_eq!(lights[&1], (1, None));
+    }
+
+    #[test]
     fn a_reader_link_is_recorded_once_per_change() {
         let soon = Duration::from_secs(1);
         let late = OFFLINE_AFTER_START;
@@ -1494,8 +1656,8 @@ mod tests {
             status = bus.take_status();
             thread::sleep(Duration::from_millis(5));
         }
-        bus.feedback(0, Feedback::Granted);
-        bus.feedback(5, Feedback::Granted); // no reader on that port: ignored
+        bus.feedback(0, Feedback::Granted, None);
+        bus.feedback(5, Feedback::Granted, None); // no reader on that port: ignored
         let deadline = Instant::now() + Duration::from_secs(10);
         while received.lock().unwrap().len() < 2 && Instant::now() < deadline {
             bus.poll();
