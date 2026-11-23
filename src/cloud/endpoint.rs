@@ -217,9 +217,7 @@ async fn stream_once(device_id: &str, device_secret: &str, nudges: &mpsc::Sender
     let mut response = stream_client()?
         .get(format!("{}/v1/stream", base_url()?))
         .header("x-indagate-device-id", device_id)
-        .header("x-nexus-device-id", device_id)
         .header("x-indagate-device-secret", device_secret)
-        .header("x-nexus-device-secret", device_secret)
         .send()
         .await
         .context("open push stream")?;

@@ -1,6 +1,7 @@
 mod access;
 mod cloud;
 mod hal;
+mod paths;
 mod storage;
 
 use anyhow::{Result, anyhow};
@@ -147,14 +148,14 @@ async fn main() -> Result<()> {
     let profile = hal::profile::acp4wr6_r1();
 
     let db_path =
-        std::env::var("INDAGATE_DB_PATH").or_else(|_| std::env::var("NEXUS_DB_PATH")).unwrap_or_else(|_| storage::DEFAULT_DB_PATH.to_string());
+        std::env::var("INDAGATE_DB_PATH").or_else(|_| std::env::var("NEXUS_DB_PATH")).unwrap_or_else(|_| paths::default_db_path());
 
     // Offline schema migration check for an EXPLICITLY SUPPLIED test DB only.
     // Must exit before hardware inspection, I/O workers, or cloud operations.
     if args.get(1).map(String::as_str) == Some("migrate-only") {
         let explicit_path = std::env::var("INDAGATE_DB_PATH").or_else(|_| std::env::var("NEXUS_DB_PATH"))
             .map_err(|_| anyhow!("migrate-only requires explicit INDAGATE_DB_PATH"))?;
-        if explicit_path == storage::DEFAULT_DB_PATH {
+        if paths::is_live_db(&explicit_path) {
             return Err(anyhow!("migrate-only refuses the default live database"));
         }
         let test_path = std::path::Path::new(&explicit_path);

@@ -95,9 +95,7 @@ impl<C: CloudConfirmation> NetworkTransactionBackend for LiveNetworkBackend<C> {
         if self.host_lock.is_some() {
             return Err(anyhow!("network transaction lock already held"));
         }
-        self.host_lock = Some(HostNetworkLock::acquire(Path::new(
-            "/run/lock/hlaxs-network.lock",
-        ))?);
+        self.host_lock = Some(HostNetworkLock::acquire(Path::new(crate::paths::NETWORK_LOCK))?);
 
         if plan.interface != "wlan0" {
             return Err(anyhow!("unsupported network interface"));

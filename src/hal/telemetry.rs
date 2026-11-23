@@ -42,16 +42,22 @@ fn kernel_version() -> Option<String> {
     command_output("uname", &["-r"])
 }
 
+/// The systemd unit a process belongs to, from the text of its `/proc/<pid>/cgroup`:
+/// the last part of the path, when it is a service.
+fn unit_from_cgroup(cgroup: &str) -> Option<String> {
+    cgroup
+        .lines()
+        .filter_map(|line| line.rsplit('/').next())
+        .map(str::trim)
+        .find(|part| part.ends_with(".service") && part.len() > ".service".len())
+        .map(str::to_string)
+}
+
+/// How many times systemd has restarted this controller's own service. The service is
+/// whichever one this process runs in, so it needs no name built in.
 fn service_restart_count() -> Option<u64> {
-    command_output(
-        "systemctl",
-        &[
-            "show",
-            "highline-nexus-controller.service",
-            "--property=NRestarts",
-            "--value",
-        ],
-    )?
+    let unit = unit_from_cgroup(&std::fs::read_to_string("/proc/self/cgroup").ok()?)?;
+    command_output("systemctl", &["show", &unit, "--property=NRestarts", "--value"])?
     .parse::<u64>()
     .ok()
 }
@@ -437,7 +443,7 @@ pub fn checkin_payload(event_count: i64, applied_version: u64) -> Value {
     json!({
         "software": {
             "agent_version": env!("CARGO_PKG_VERSION"),
-            "firmware_version": "hlaxs-access-sp4-dev",
+            "firmware_version": "indagate-controller-sp4-dev",
             "os_version": os_version(),
             "kernel_version": kernel_version()
         },
@@ -471,4 +477,19 @@ pub fn checkin_payload(event_count: i64, applied_version: u64) -> Value {
             }
         }
     })
+}
+
+#[cfg(test)]
+mod unit_name_tests {
+    use super::unit_from_cgroup;
+
+    #[test]
+    fn the_service_is_read_from_the_process_own_cgroup() {
+        assert_eq!(unit_from_cgroup("0::/system.slice/indagate-controller.service\n").as_deref(), Some("indagate-controller.service"));
+        assert_eq!(unit_from_cgroup("0::/system.slice/hlaxs-access.service").as_deref(), Some("hlaxs-access.service"));
+        // Run by hand in a login session: not a service.
+        assert_eq!(unit_from_cgroup("0::/user.slice/user-0.slice/session-3.scope"), None);
+        assert_eq!(unit_from_cgroup(""), None);
+        assert_eq!(unit_from_cgroup("0::/.service"), None);
+    }
 }

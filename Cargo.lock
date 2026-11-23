@@ -354,30 +354,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "highline-nexus-controller"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "chrono",
- "chrono-tz",
- "glob",
- "gpio-cdev",
- "libc",
- "libosdp",
- "reqwest",
- "ring",
- "rusqlite",
- "serde",
- "serde_json",
- "thiserror",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "urlencoding",
- "uuid",
-]
-
-[[package]]
 name = "http"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -601,6 +577,30 @@ checksum = "cb68373c0d6620ef8105e855e7745e18b0d00d3bdb07fb532e434244cdb9a714"
 dependencies = [
  "icu_normalizer",
  "icu_properties",
+]
+
+[[package]]
+name = "indagate-controller"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "chrono-tz",
+ "glob",
+ "gpio-cdev",
+ "libc",
+ "libosdp",
+ "reqwest",
+ "ring",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "urlencoding",
+ "uuid",
 ]
 
 [[package]]

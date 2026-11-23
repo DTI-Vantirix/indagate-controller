@@ -330,12 +330,9 @@ fn default_timezone() -> String {
     "America/New_York".to_string()
 }
 
-fn config_dir() -> &'static str {
-    "/var/lib/highline-nexus"
-}
-
+/// The controller's identity file, in its data folder (see `crate::paths`).
 fn identity_path() -> &'static str {
-    "/var/lib/highline-nexus/device.json"
+    crate::paths::identity_path()
 }
 
 fn save_identity_atomic(identity: &DeviceIdentity) -> Result<()> {
@@ -398,14 +395,13 @@ pub async fn enroll(enrollment_token: &str, hardware_serial: &str) -> Result<Dev
         },
         "software": {
             "agent_version": env!("CARGO_PKG_VERSION"),
-            "firmware_version": "nexus-agent-dev"
+            "firmware_version": "indagate-controller-dev"
         }
     });
 
     let response = client
         .post(format!("{}/v1/enroll", super::endpoint::base_url()?))
         .header("x-indagate-enrollment-token", enrollment_token)
-        .header("x-nexus-enrollment-token", enrollment_token)
         .json(&body)
         .send()
         .await
@@ -438,9 +434,7 @@ async fn authenticated_get(identity: &DeviceIdentity, path: &str) -> Result<ApiE
     let response = client()?
         .get(format!("{}{}", super::endpoint::base_url()?, path))
         .header("x-indagate-device-id", &identity.device_id)
-        .header("x-nexus-device-id", &identity.device_id)
         .header("x-indagate-device-secret", &identity.device_secret)
-        .header("x-nexus-device-secret", &identity.device_secret)
         .send()
         .await?;
 
@@ -455,9 +449,7 @@ async fn authenticated_post(
     let response = client()?
         .post(format!("{}{}", super::endpoint::base_url()?, path))
         .header("x-indagate-device-id", &identity.device_id)
-        .header("x-nexus-device-id", &identity.device_id)
         .header("x-indagate-device-secret", &identity.device_secret)
-        .header("x-nexus-device-secret", &identity.device_secret)
         .json(&body)
         .send()
         .await?;
@@ -2435,7 +2427,7 @@ mod live_server_tests {
     //! controller that has at least one command waiting, then:
     //!
     //! ```text
-    //! cargo test --bin highline-nexus-controller live_server -- --ignored --nocapture
+    //! cargo test --bin indagate-controller live_server -- --ignored --nocapture
     //! ```
     //!
     //! It touches no hardware, no identity file and no local database.

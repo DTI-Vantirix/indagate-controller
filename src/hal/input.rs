@@ -50,7 +50,7 @@ fn read_via_cdev(line: &GpioLine) -> Result<u8, String> {
         .map_err(|e| format!("get line {} failed: {}", line.line, e))?;
 
     let handle = gpio_line
-        .request(LineRequestFlags::INPUT, 0, "highline-nexus-observe")
+        .request(LineRequestFlags::INPUT, 0, "indagate-observe")
         .map_err(|e| format!("request input failed: {}", e))?;
 
     handle

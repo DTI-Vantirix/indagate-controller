@@ -3,7 +3,6 @@ use rusqlite::{Connection, params};
 use std::fs;
 use std::path::Path;
 
-pub const DEFAULT_DB_PATH: &str = "/var/lib/highline-nexus/nexus.db";
 
 pub struct ControllerDatabase {
     conn: Connection,
