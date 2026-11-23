@@ -556,6 +556,11 @@ pub async fn run(serial_port: &str, db_path: &str, relay_tx: tokio::sync::mpsc::
         super::card_read::queue_event(db, name, channel, serde_json::json!({ "reader": channel + 1, "source": "osdp" }));
     };
     let mut last_waiting: Vec<u8> = Vec::new();
+    // What has been recorded about each reader port. Kept across restarts of the bus, so
+    // a reader that answers again straight after one is not recorded as lost and found.
+    let mut watches: std::collections::HashMap<u8, ReaderWatch> = std::collections::HashMap::new();
+    // How many times in a row the bus was reopened for a reader that is not answering.
+    let mut quiet_retries: u32 = 0;
     loop {
         for channel in expire_key_changes(&db, chrono::Utc::now()) {
             tracing::warn!(target: "indagate_osdp", reader = channel + 1, "OSDP reader key change ran out of time before it could start");
@@ -595,7 +600,7 @@ pub async fn run(serial_port: &str, db_path: &str, relay_tx: tokio::sync::mpsc::
         tracing::info!(target: "indagate_osdp", readers = readers.len(), port = serial_port, "OSDP readers started");
 
         let started = std::time::Instant::now();
-        let mut watches: Vec<ReaderWatch> = readers.iter().map(|_| ReaderWatch::default()).collect();
+        watches.retain(|channel, _| readers.iter().any(|reader| reader.channel == *channel));
         let mut secure_since: Vec<Option<std::time::Instant>> = readers.iter().map(|_| None).collect();
         let mut key_sent_at: Vec<Option<std::time::Instant>> = readers.iter().map(|_| None).collect();
         let mut settings_checked = std::time::Instant::now();
@@ -612,7 +617,7 @@ pub async fn run(serial_port: &str, db_path: &str, relay_tx: tokio::sync::mpsc::
             }
             for (index, link) in bus.links().into_iter().enumerate() {
                 // A reader going quiet or coming back is recorded as an event, once per change.
-                if let Some(name) = watches[index].link_event(link.online, started.elapsed()) {
+                if let Some(name) = watches.entry(link.channel).or_default().link_event(link.online, std::time::Instant::now()) {
                     // A reader that lost power has forgotten its light: tell it again.
                     shown[index] = None;
                     tracing::info!(target: "indagate_osdp", reader = link.channel + 1, event = name, secure = link.secure, "OSDP reader link changed");
@@ -704,11 +709,25 @@ pub async fn run(serial_port: &str, db_path: &str, relay_tx: tokio::sync::mpsc::
             }
             // Tamper and power reports, once per change.
             for status in bus.take_status() {
-                let Some(watch) = bus_index(&bus, status.channel).and_then(|i| watches.get_mut(i)) else { continue };
+                let watch = watches.entry(status.channel).or_default();
                 for name in watch.status_events(status.tamper, status.power_failure) {
                     tracing::warn!(target: "indagate_osdp", reader = status.channel + 1, event = name, "OSDP reader status changed");
                     event(&db, name, status.channel);
                 }
+            }
+            // A reader that is not answering. LibOSDP leaves one that failed alone for
+            // five minutes; a bus that is opened afresh tries every reader at once. So the
+            // bus is reopened: soon the first time, then less often, because the other
+            // readers on the line have to reconnect each time (a second or two). A key
+            // change in progress times its own sessions and is left to it.
+            if bus.links().iter().all(|link| link.online) {
+                quiet_retries = 0;
+            } else if readers.iter().all(|reader| reader.key_change == KeyChange::None)
+                && started.elapsed() >= quiet_retry_after(quiet_retries)
+            {
+                quiet_retries = quiet_retries.saturating_add(1);
+                tracing::debug!(target: "indagate_osdp", attempt = quiet_retries, "an OSDP reader is not answering; reopening the bus to try it again");
+                break;
             }
             if settings_checked.elapsed() >= SETTINGS_CHECK_EVERY {
                 settings_checked = std::time::Instant::now();
@@ -1005,8 +1024,14 @@ fn forget_key(db: &crate::storage::ControllerDatabase, payload: &serde_json::Val
 /// offline. Bringing a reader online takes a second or two.
 const OFFLINE_AFTER_START: std::time::Duration = std::time::Duration::from_secs(15);
 
-fn bus_index(bus: &OsdpBus, channel: u8) -> Option<usize> {
-    bus.channels.iter().position(|c| *c == channel)
+/// How long a reader that was answering may be quiet before it is recorded as offline.
+/// Long enough to cover the bus being reopened, short enough to be news.
+const OFFLINE_AFTER_QUIET: std::time::Duration = std::time::Duration::from_secs(6);
+
+/// How long a bus with a reader that is not answering runs before it is reopened to try
+/// that reader again: 10 seconds, then 20, 40, and once a minute from then on.
+fn quiet_retry_after(retries: u32) -> std::time::Duration {
+    std::time::Duration::from_secs((10u64 << retries.min(3)).min(60))
 }
 
 /// Anything but a grant sounds and shows as a refusal, an unreadable card included.
@@ -1021,30 +1046,38 @@ fn feedback_for(outcome: super::card_read::ReadOutcome) -> Feedback {
 #[derive(Debug, Default)]
 struct ReaderWatch {
     online: Option<bool>,
+    /// Since when the reader has not been answering, while it is not.
+    quiet_since: Option<std::time::Instant>,
     tamper: Option<bool>,
     power_failure: Option<bool>,
 }
 
 impl ReaderWatch {
-    /// The event to record for the reader's link state, if it is news.
-    fn link_event(&mut self, online: bool, since_start: std::time::Duration) -> Option<&'static str> {
-        match (self.online, online) {
-            (Some(true), true) | (Some(false), false) => None,
-            (_, true) => {
-                self.online = Some(true);
-                Some("reader_online")
+    /// The event to record for the reader's link state at `now`, if it is news.
+    ///
+    /// Going quiet is news only once it has lasted: a reader never seen gets
+    /// `OFFLINE_AFTER_START` to answer, and one that was answering gets
+    /// `OFFLINE_AFTER_QUIET`, which covers the bus being reopened.
+    fn link_event(&mut self, online: bool, now: std::time::Instant) -> Option<&'static str> {
+        if online {
+            self.quiet_since = None;
+            if self.online == Some(true) {
+                return None;
             }
-            (Some(true), false) => {
-                self.online = Some(false);
-                Some("reader_offline")
-            }
-            // Never seen yet: give it time to answer before calling it offline.
-            (None, false) if since_start >= OFFLINE_AFTER_START => {
-                self.online = Some(false);
-                Some("reader_offline")
-            }
-            (None, false) => None,
+            self.online = Some(true);
+            return Some("reader_online");
         }
+        let quiet_for = now.saturating_duration_since(*self.quiet_since.get_or_insert(now));
+        let allowed = match self.online {
+            Some(false) => return None,
+            Some(true) => OFFLINE_AFTER_QUIET,
+            None => OFFLINE_AFTER_START,
+        };
+        if quiet_for < allowed {
+            return None;
+        }
+        self.online = Some(false);
+        Some("reader_offline")
     }
 
     /// The events to record for a status report. The first report from a healthy reader
@@ -1560,20 +1593,34 @@ mod tests {
 
     #[test]
     fn a_reader_link_is_recorded_once_per_change() {
-        let soon = Duration::from_secs(1);
-        let late = OFFLINE_AFTER_START;
+        let start = Instant::now();
+        let at = |seconds: u64| start + Duration::from_secs(seconds);
         let mut watch = ReaderWatch::default();
-        assert_eq!(watch.link_event(false, soon), None, "a reader gets time to answer");
-        assert_eq!(watch.link_event(true, soon), Some("reader_online"));
-        assert_eq!(watch.link_event(true, late), None);
-        assert_eq!(watch.link_event(false, late), Some("reader_offline"));
-        assert_eq!(watch.link_event(false, late), None);
-        assert_eq!(watch.link_event(true, late), Some("reader_online"));
+        assert_eq!(watch.link_event(false, at(0)), None, "a reader gets time to answer");
+        assert_eq!(watch.link_event(true, at(1)), Some("reader_online"));
+        assert_eq!(watch.link_event(true, at(20)), None);
+        // Quiet for a moment, as when the bus is reopened: not news.
+        assert_eq!(watch.link_event(false, at(21)), None);
+        assert_eq!(watch.link_event(false, at(23)), None);
+        assert_eq!(watch.link_event(true, at(24)), None, "it never counted as offline");
+        // Quiet for longer: offline, once.
+        assert_eq!(watch.link_event(false, at(30)), None);
+        assert_eq!(watch.link_event(false, at(30) + OFFLINE_AFTER_QUIET), Some("reader_offline"));
+        assert_eq!(watch.link_event(false, at(60)), None);
+        assert_eq!(watch.link_event(true, at(61)), Some("reader_online"));
 
         let mut never_answered = ReaderWatch::default();
-        assert_eq!(never_answered.link_event(false, soon), None);
-        assert_eq!(never_answered.link_event(false, late), Some("reader_offline"));
-        assert_eq!(never_answered.link_event(false, late), None);
+        assert_eq!(never_answered.link_event(false, at(0)), None);
+        assert_eq!(never_answered.link_event(false, at(1)), None);
+        assert_eq!(never_answered.link_event(false, at(0) + OFFLINE_AFTER_START), Some("reader_offline"));
+        assert_eq!(never_answered.link_event(false, at(600)), None);
+    }
+
+    #[test]
+    fn a_quiet_reader_is_tried_again_soon_and_then_less_often() {
+        let seconds: Vec<u64> = (0..6).map(|retries| quiet_retry_after(retries).as_secs()).collect();
+        assert_eq!(seconds, vec![10, 20, 40, 60, 60, 60]);
+        assert_eq!(quiet_retry_after(u32::MAX).as_secs(), 60);
     }
 
     #[test]
