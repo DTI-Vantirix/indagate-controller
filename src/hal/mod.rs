@@ -1,3 +1,4 @@
+pub mod board_setup;
 pub mod card_read;
 pub mod door_alarm;
 pub mod health;

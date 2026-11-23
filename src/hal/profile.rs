@@ -35,6 +35,9 @@ pub struct BoardProfile {
     pub readers: Vec<ReaderProfile>,
     pub relays: Vec<RelayProfile>,
     pub fire: GpioLine,
+    /// The line that switches the board's I/O on: until it is driven high the I2C bus the
+    /// relay chip sits on does not work. `None` for a board that needs no such line.
+    pub io_enable: Option<GpioLine>,
     pub rs485_device: &'static str,
 }
 
@@ -179,6 +182,13 @@ pub fn acp4wr6_r1() -> BoardProfile {
             chip: "gpiochip3",
             line: 21,
         },
+
+        // Found on the bench 2026-11-23: with this line low the kernel reports the relay
+        // chip's bus as stuck and no relay can be switched.
+        io_enable: Some(GpioLine {
+            chip: "gpiochip0",
+            line: 6,
+        }),
 
         rs485_device: "/dev/ttymxc0",
     }

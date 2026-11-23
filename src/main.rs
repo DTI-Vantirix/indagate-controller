@@ -141,11 +141,15 @@ async fn main() -> Result<()> {
         ));
     }
 
+    let profile = hal::profile::acp4wr6_r1();
+
+    // The board's inputs and its relay chip only work once its lines have been prepared.
+    // Nothing else on the board does that any more, so it is the first thing done.
+    hal::board_setup::prepare(&profile);
+
     if relay_command(&args)? {
         return Ok(());
     }
-
-    let profile = hal::profile::acp4wr6_r1();
 
     let db_path =
         std::env::var("INDAGATE_DB_PATH").or_else(|_| std::env::var("NEXUS_DB_PATH")).unwrap_or_else(|_| paths::default_db_path());
