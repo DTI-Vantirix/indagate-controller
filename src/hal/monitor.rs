@@ -12,7 +12,8 @@ use uuid::Uuid;
 use crate::storage::ControllerDatabase;
 
 use super::profile::{BoardProfile, GpioLine};
-use super::relay_worker::{RelayCommand, Relock};
+use super::door_alarm::{AlarmSettings, DoorWatch};
+use super::relay_worker::{RelayCommand, Relock, door_state};
 
 #[derive(Debug, Clone, Copy)]
 enum InputKind {
@@ -104,6 +105,20 @@ fn build_watch_list(profile: &BoardProfile) -> Vec<WatchedInput> {
     let mut inputs = Vec::new();
 
     for door in &profile.doors {
+        // The request to exit is listed before the door's contact, so when both change
+        // in the same round the release is known before the door is seen to open.
+        if let Some(gpio) = legacy_gpio(&door.rex) {
+            inputs.push(WatchedInput {
+                name: format!("rex{}", door.channel + 1),
+                kind: InputKind::Rex,
+                channel: Some(door.channel),
+                legacy_gpio: gpio,
+                last_raw: None,
+                candidate_raw: None,
+                candidate_since: None,
+            });
+        }
+
         if let Some(gpio) = legacy_gpio(&door.contact) {
             inputs.push(WatchedInput {
                 name: format!("door{}_contact", door.channel + 1),
@@ -116,17 +131,6 @@ fn build_watch_list(profile: &BoardProfile) -> Vec<WatchedInput> {
             });
         }
 
-        if let Some(gpio) = legacy_gpio(&door.rex) {
-            inputs.push(WatchedInput {
-                name: format!("rex{}", door.channel + 1),
-                kind: InputKind::Rex,
-                channel: Some(door.channel),
-                legacy_gpio: gpio,
-                last_raw: None,
-                candidate_raw: None,
-                candidate_since: None,
-            });
-        }
     }
 
     if let Some(gpio) = legacy_gpio(&profile.fire) {
@@ -434,6 +438,19 @@ async fn process_change(
     }
 }
 
+/// How long after a request to exit a door that opens counts as released by it, to cover
+/// the moment the relay takes to follow.
+const REX_RELEASE_GRACE: Duration = Duration::from_secs(1);
+
+/// The door's state for judging whether it was forced. A locked door whose request to
+/// exit went active a moment ago is being released. A door that is locked down is not:
+/// its request to exit is refused.
+fn released_by_rex(state: super::relay_worker::DoorState, rex_at: Option<Instant>, now: Instant) -> super::relay_worker::DoorState {
+    use super::relay_worker::DoorState;
+    let recent = rex_at.is_some_and(|at| now.saturating_duration_since(at) <= REX_RELEASE_GRACE);
+    if state == DoorState::Locked && recent { DoorState::Unlocking } else { state }
+}
+
 pub async fn run(profile: &BoardProfile, db_path: &str, relay_tx: mpsc::Sender<RelayCommand>) {
     const POLL_INTERVAL_MS: u64 = 20;
     const DEBOUNCE_MS: u64 = 75;
@@ -454,6 +471,19 @@ pub async fn run(profile: &BoardProfile, db_path: &str, relay_tx: mpsc::Sender<R
     let mut inputs = build_watch_list(profile);
 
     let mut read_errors: HashMap<u32, Instant> = HashMap::new();
+
+    // Door alarms: one watch per door, and each door's settings, read again every few
+    // seconds so a change takes effect without a restart.
+    let mut door_watches: [DoorWatch; 4] = Default::default();
+    let mut alarm_settings: [AlarmSettings; 4] = db.door_alarm_settings().unwrap_or_default();
+    let mut alarm_settings_read = Instant::now();
+    // When each door's request to exit last went active. The relay follows a moment
+    // later, so a door that opens straight after is counted as released.
+    let mut rex_at: [Option<Instant>; 4] = [None; 4];
+    let alarm_event = |db: &ControllerDatabase, name: &str, channel: u8| {
+        warn!(target: "indagate_door", event = name, channel = channel, door = channel + 1, "DOOR ALARM");
+        queue_event(db, name, Some(channel), json!({ "channel": channel, "door": channel + 1 }));
+    };
 
     info!(
         "Input monitor started: {} inputs, {} ms polling, {} ms debounce",
@@ -482,6 +512,13 @@ pub async fn run(profile: &BoardProfile, db_path: &str, relay_tx: mpsc::Sender<R
                     "Input initialized"
                 );
 
+                if let (InputKind::Door, Some(channel)) = (input.kind, input.channel) {
+                    if let Some(watch) = door_watches.get_mut(usize::from(channel)) {
+                        watch.start(raw == 1, Instant::now());
+                        watch.publish(channel);
+                    }
+                }
+
                 process_initial_state(input, raw, &db, &relay_tx).await;
             }
 
@@ -498,6 +535,21 @@ pub async fn run(profile: &BoardProfile, db_path: &str, relay_tx: mpsc::Sender<R
 
     loop {
         let now = Instant::now();
+
+        if now.duration_since(alarm_settings_read) >= Duration::from_secs(3) {
+            alarm_settings_read = now;
+            if let Ok(settings) = db.door_alarm_settings() {
+                alarm_settings = settings;
+            }
+        }
+        // A door that has stood open too long.
+        for channel in 0u8..4 {
+            let index = usize::from(channel);
+            if let Some(name) = door_watches[index].tick(door_state(channel), alarm_settings[index], now) {
+                door_watches[index].publish(channel);
+                alarm_event(&db, name, channel);
+            }
+        }
 
         for input in &mut inputs {
             let raw = match read_sysfs_gpio(input.legacy_gpio) {
@@ -564,9 +616,62 @@ pub async fn run(profile: &BoardProfile, db_path: &str, relay_tx: mpsc::Sender<R
                 "INPUT CHANGE"
             );
 
+            // Judged before the relay worker hears of the change: what matters is what
+            // the door was doing at the moment it opened.
+            if let (InputKind::Rex, Some(channel), 0) = (input.kind, input.channel, raw) {
+                if let Some(slot) = rex_at.get_mut(usize::from(channel)) {
+                    *slot = Some(now);
+                }
+            }
+            if let (InputKind::Door, Some(channel)) = (input.kind, input.channel) {
+                let index = usize::from(channel);
+                if let Some(watch) = door_watches.get_mut(index) {
+                    let state = released_by_rex(door_state(channel), rex_at[index], now);
+                    let event = watch.contact(raw == 1, state, alarm_settings[index], now);
+                    watch.publish(channel);
+                    if let Some(name) = event {
+                        alarm_event(&db, name, channel);
+                    }
+                }
+            }
+
             process_change(input, previous, raw, &db, &relay_tx).await;
         }
 
         sleep(Duration::from_millis(POLL_INTERVAL_MS)).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hal::relay_worker::DoorState;
+
+    #[test]
+    fn a_door_opened_straight_after_its_request_to_exit_is_released() {
+        let now = Instant::now();
+        let just_now = Some(now - Duration::from_millis(200));
+        let a_while_ago = Some(now - Duration::from_secs(5));
+        assert_eq!(released_by_rex(DoorState::Locked, just_now, now), DoorState::Unlocking);
+        assert_eq!(released_by_rex(DoorState::Locked, a_while_ago, now), DoorState::Locked);
+        assert_eq!(released_by_rex(DoorState::Locked, None, now), DoorState::Locked);
+        // A locked-down door refuses its request to exit, so it is still locked down.
+        assert_eq!(released_by_rex(DoorState::ForcedLocked, just_now, now), DoorState::ForcedLocked);
+    }
+
+    #[test]
+    fn a_request_to_exit_is_watched_before_its_doors_contact() {
+        let profile = crate::hal::profile::acp4wr6_r1();
+        let inputs = build_watch_list(&profile);
+        for channel in 0u8..4 {
+            let position = |kind: fn(&InputKind) -> bool| {
+                inputs.iter().position(|input| input.channel == Some(channel) && kind(&input.kind))
+            };
+            let rex = position(|kind| matches!(kind, InputKind::Rex));
+            let contact = position(|kind| matches!(kind, InputKind::Door));
+            if let (Some(rex), Some(contact)) = (rex, contact) {
+                assert!(rex < contact, "door {}", channel + 1);
+            }
+        }
     }
 }

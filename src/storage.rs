@@ -203,6 +203,18 @@ impl ControllerDatabase {
             self.conn.execute("ALTER TABLE door_config ADD COLUMN rex_relock TEXT", [])?;
         }
 
+        // Door alarms: forced open, and held open after so many seconds. Absent means off.
+        for (column, definition) in [("forced_open_alarm", "INTEGER NOT NULL DEFAULT 0"), ("held_open_seconds", "INTEGER NOT NULL DEFAULT 0")] {
+            let present = {
+                let mut stmt = self.conn.prepare("PRAGMA table_info(door_config)")?;
+                let columns = stmt.query_map([], |row| row.get::<_, String>(1))?;
+                columns.collect::<rusqlite::Result<Vec<String>>>()?.iter().any(|existing| existing == column)
+            };
+            if !present {
+                self.conn.execute(&format!("ALTER TABLE door_config ADD COLUMN {column} {definition}"), [])?;
+            }
+        }
+
         let mut has_holiday_behavior = false;
 
         {
@@ -479,6 +491,24 @@ impl ControllerDatabase {
             readers.insert(number - 1, (door, lights));
         }
         Ok(readers)
+    }
+
+    /// The alarm settings of each enabled door, by channel. A door that is off, or has
+    /// none, raises no alarms.
+    pub fn door_alarm_settings(&self) -> Result<[crate::hal::door_alarm::AlarmSettings; 4]> {
+        let mut settings = [crate::hal::door_alarm::AlarmSettings::default(); 4];
+        let mut stmt = self
+            .conn
+            .prepare("SELECT channel, forced_open_alarm, held_open_seconds FROM door_config WHERE enabled = 1")?;
+        let rows = stmt.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?)))?;
+        for row in rows {
+            let (channel, forced, held) = row?;
+            if let Some(slot) = usize::try_from(channel).ok().and_then(|index| settings.get_mut(index)) {
+                slot.forced_open = forced != 0;
+                slot.held_open_seconds = u32::try_from(held).unwrap_or(0);
+            }
+        }
+        Ok(settings)
     }
 
     /// How a door released by its request to exit relocks (`timed`, `door_open`,

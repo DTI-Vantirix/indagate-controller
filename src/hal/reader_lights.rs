@@ -10,6 +10,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use super::door_alarm::DoorAlarm;
 use super::relay_worker::DoorState;
 
 /// A colour every OSDP reader with a light can show.
@@ -21,6 +22,16 @@ pub enum LightColor {
     Green,
     Amber,
     Blue,
+}
+
+/// How a resting light is shown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Blink {
+    Steady,
+    /// A slow flash: the door is locked down.
+    Slow,
+    /// A quick flash: the door is forced or held open.
+    Fast,
 }
 
 fn red() -> LightColor {
@@ -52,10 +63,16 @@ pub struct ReaderLights {
     /// Colour flashed slowly while the door is locked down (forced locked).
     #[serde(default = "red")]
     pub lockdown: LightColor,
+    /// Colour flashed quickly while the door is forced or held open.
+    #[serde(default = "red")]
+    pub alarm: LightColor,
     #[serde(default = "yes")]
     pub beep_granted: bool,
     #[serde(default = "yes")]
     pub beep_denied: bool,
+    /// Whether the buzzer sounds while the door is forced or held open.
+    #[serde(default = "yes")]
+    pub beep_alarm: bool,
 }
 
 impl ReaderLights {
@@ -70,14 +87,23 @@ impl ReaderLights {
         }
     }
 
-    /// The light a reader rests on for its door's state: a colour, and whether it flashes.
-    pub fn resting(&self, door: DoorState) -> (LightColor, bool) {
-        match door {
-            DoorState::Locked => (self.locked, false),
-            DoorState::Unlocking => (self.granted, false),
-            DoorState::HeldUnlocked => (self.unlocked, false),
-            DoorState::ForcedLocked => (self.lockdown, true),
+    /// The light a reader rests on: a colour and how it is shown. A door alarm comes
+    /// before anything the door is otherwise doing.
+    pub fn resting(&self, door: DoorState, alarm: DoorAlarm) -> (LightColor, Blink) {
+        if alarm != DoorAlarm::None {
+            return (self.alarm, Blink::Fast);
         }
+        match door {
+            DoorState::Locked => (self.locked, Blink::Steady),
+            DoorState::Unlocking => (self.granted, Blink::Steady),
+            DoorState::HeldUnlocked => (self.unlocked, Blink::Steady),
+            DoorState::ForcedLocked => (self.lockdown, Blink::Slow),
+        }
+    }
+
+    /// Whether the reader's buzzer sounds for this alarm.
+    pub fn sounds(&self, alarm: DoorAlarm) -> bool {
+        self.beep_alarm && alarm != DoorAlarm::None
     }
 }
 
@@ -121,9 +147,25 @@ mod tests {
     #[test]
     fn the_resting_light_follows_the_door() {
         let lights = ReaderLights::from_configuration(&json!({ "lights": { "granted": "blue", "lockdown": "amber" } })).unwrap().unwrap();
-        assert_eq!(lights.resting(DoorState::Locked), (LightColor::Red, false));
-        assert_eq!(lights.resting(DoorState::Unlocking), (LightColor::Blue, false));
-        assert_eq!(lights.resting(DoorState::HeldUnlocked), (LightColor::Green, false));
-        assert_eq!(lights.resting(DoorState::ForcedLocked), (LightColor::Amber, true));
+        let quiet = DoorAlarm::None;
+        assert_eq!(lights.resting(DoorState::Locked, quiet), (LightColor::Red, Blink::Steady));
+        assert_eq!(lights.resting(DoorState::Unlocking, quiet), (LightColor::Blue, Blink::Steady));
+        assert_eq!(lights.resting(DoorState::HeldUnlocked, quiet), (LightColor::Green, Blink::Steady));
+        assert_eq!(lights.resting(DoorState::ForcedLocked, quiet), (LightColor::Amber, Blink::Slow));
+    }
+
+    #[test]
+    fn a_door_alarm_comes_before_the_doors_state() {
+        let lights = ReaderLights::from_configuration(&json!({ "lights": { "alarm": "amber" } })).unwrap().unwrap();
+        for alarm in [DoorAlarm::Forced, DoorAlarm::Held] {
+            assert_eq!(lights.resting(DoorState::Locked, alarm), (LightColor::Amber, Blink::Fast));
+            assert_eq!(lights.resting(DoorState::Unlocking, alarm), (LightColor::Amber, Blink::Fast));
+            assert!(lights.sounds(alarm));
+        }
+        assert!(!lights.sounds(DoorAlarm::None));
+        let silent = ReaderLights::from_configuration(&json!({ "lights": { "beep_alarm": false } })).unwrap().unwrap();
+        assert!(!silent.sounds(DoorAlarm::Forced));
+        // Settings from before alarms existed take the usual values.
+        assert_eq!(silent.alarm, LightColor::Red);
     }
 }

@@ -1,4 +1,5 @@
 pub mod card_read;
+pub mod door_alarm;
 pub mod health;
 pub mod input;
 pub mod monitor;

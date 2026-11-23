@@ -124,6 +124,14 @@ struct CloudDoor {
     /// or `door_closed`. Absent means timed.
     #[serde(default)]
     rex_relock: Option<String>,
+
+    /// Raise an alarm when the door opens while locked. Absent means no.
+    #[serde(default)]
+    forced_open_alarm: bool,
+
+    /// Raise an alarm when the door has been open this many seconds. Absent or zero: never.
+    #[serde(default)]
+    held_open_seconds: u32,
 }
 
 // SA16Q READER POLICY V1: all reader authorization fields must arrive
@@ -715,7 +723,8 @@ async fn upload_events(identity: &DeviceIdentity, db: &ControllerDatabase) -> Re
             | "reader_secure_channel_rotate_expired"
             | "access_error"
             | "rex_error"
-            | "rex_ignored" => "system",
+            | "rex_ignored"
+            | "door_alarm_cleared" => "system",
             other => other,
         };
 
@@ -1660,6 +1669,8 @@ fn apply_cloud_configuration(
                 unlock_ms = ?4,
                 unlock_schedule_id = ?5,
                 rex_relock = ?6,
+                forced_open_alarm = ?7,
+                held_open_seconds = ?8,
                 updated_at = CURRENT_TIMESTAMP
             WHERE channel = ?1
             "#,
@@ -1671,6 +1682,8 @@ fn apply_cloud_configuration(
                 door.unlock_schedule_id,
                 // Stored as understood, so an unknown value cannot linger.
                 crate::hal::relay_worker::Relock::from_setting(door.rex_relock.as_deref()).name(),
+                i64::from(door.forced_open_alarm),
+                i64::from(door.held_open_seconds.min(86_400)),
             ],
         )?;
 
