@@ -120,8 +120,9 @@ struct CloudDoor {
     #[serde(default)]
     unlock_schedule_id: Option<String>,
 
-    /// How the door relocks after its request to exit released it: `timed`, `door_open`
-    /// or `door_closed`. Absent means timed.
+    /// How the door relocks after a card, its request to exit or a remote unlock released
+    /// it: `timed`, `door_open` or `door_closed`. Absent means timed. The name dates from
+    /// when the setting was for the request to exit alone.
     #[serde(default)]
     rex_relock: Option<String>,
 

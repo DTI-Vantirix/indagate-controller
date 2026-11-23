@@ -42,7 +42,9 @@ impl Default for PersistedOverrideFile {
     }
 }
 
-/// When a door released by its request-to-exit input locks again.
+/// When a door that was released for a moment locks again: after a card, a request to
+/// exit or a remote unlock alike. Whatever the rule, a door that is never opened locks
+/// when the unlock time runs out.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Relock {
     /// When the unlock time runs out.
@@ -107,6 +109,14 @@ pub enum RelayCommand {
     Release {
         channel: u8,
         duration_ms: u64,
+        relock: Relock,
+    },
+
+    //
+    // How a door relocks after any momentary release (its setting).
+    //
+    DoorRelock {
+        channel: u8,
         relock: Relock,
     },
 
@@ -356,6 +366,8 @@ pub async fn run(mut receiver: mpsc::Receiver<RelayCommand>) {
     // whether a pulse is being held until its door closes.
     //
     let mut relock_modes = [Relock::Timed; 4];
+    // Each door's own setting, used for every pulse that does not bring a rule with it.
+    let mut door_relock = [Relock::Timed; 4];
     let mut door_open = [false; 4];
     let mut waiting_for_close = [false; 4];
 
@@ -414,11 +426,21 @@ pub async fn run(mut receiver: mpsc::Receiver<RelayCommand>) {
                     RelayCommand::Release { channel, duration_ms, relock } => {
                         (RelayCommand::Pulse { channel, duration_ms, response: None }, relock)
                     }
+                    RelayCommand::Pulse { channel, duration_ms, response } => {
+                        let relock = door_relock.get(channel as usize).copied().unwrap_or_default();
+                        (RelayCommand::Pulse { channel, duration_ms, response }, relock)
+                    }
                     other => (other, Relock::Timed),
                 };
 
                 match command {
                     RelayCommand::Release { .. } => {}
+
+                    RelayCommand::DoorRelock { channel, relock } => {
+                        if valid_channel(channel) {
+                            door_relock[channel as usize] = relock;
+                        }
+                    }
 
                     RelayCommand::DoorContact { channel, open } => {
                         if !valid_channel(channel) {

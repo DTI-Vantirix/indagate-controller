@@ -511,8 +511,9 @@ impl ControllerDatabase {
         Ok(settings)
     }
 
-    /// How a door released by its request to exit relocks (`timed`, `door_open`,
-    /// `door_closed`); `None` when nothing is set.
+    /// How a door relocks after a card, a request to exit or a remote unlock released it
+    /// (`timed`, `door_open`, `door_closed`); `None` when nothing is set. The column
+    /// keeps the name it had when the setting was for the request to exit alone.
     pub fn door_rex_relock(&self, channel: u8) -> Result<Option<String>> {
         use rusqlite::OptionalExtension;
 

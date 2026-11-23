@@ -480,6 +480,14 @@ pub async fn run(profile: &BoardProfile, db_path: &str, relay_tx: mpsc::Sender<R
     // When each door's request to exit last went active. The relay follows a moment
     // later, so a door that opens straight after is counted as released.
     let mut rex_at: [Option<Instant>; 4] = [None; 4];
+    // How each door relocks after a momentary release. The relay worker is told at the
+    // start and whenever the setting changes, so cards and remote unlocks follow it too.
+    let mut relocks: [Option<Relock>; 4] = [None; 4];
+    for channel in 0u8..4 {
+        let relock = Relock::from_setting(db.door_rex_relock(channel).ok().flatten().as_deref());
+        relocks[usize::from(channel)] = Some(relock);
+        let _ = relay_tx.send(RelayCommand::DoorRelock { channel, relock }).await;
+    }
     let alarm_event = |db: &ControllerDatabase, name: &str, channel: u8| {
         warn!(target: "indagate_door", event = name, channel = channel, door = channel + 1, "DOOR ALARM");
         queue_event(db, name, Some(channel), json!({ "channel": channel, "door": channel + 1 }));
@@ -540,6 +548,13 @@ pub async fn run(profile: &BoardProfile, db_path: &str, relay_tx: mpsc::Sender<R
             alarm_settings_read = now;
             if let Ok(settings) = db.door_alarm_settings() {
                 alarm_settings = settings;
+            }
+            for channel in 0u8..4 {
+                let relock = Relock::from_setting(db.door_rex_relock(channel).ok().flatten().as_deref());
+                if relocks[usize::from(channel)] != Some(relock) {
+                    relocks[usize::from(channel)] = Some(relock);
+                    let _ = relay_tx.send(RelayCommand::DoorRelock { channel, relock }).await;
+                }
             }
         }
         // A door that has stood open too long.
