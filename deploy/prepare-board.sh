@@ -170,7 +170,7 @@ if [ "$APPLY" = 1 ] && [ -n "$PRESENT" ]; then
         chmod 600 "$archive"
         say "  archived to ${archive#"$ROOT"} ($(du -sh "$archive" | awk '{print $1}'))"
         for path in $PRESENT; do
-            rm -rf -- "${ROOT:?}$path" 2>/dev/null || rm -rf -- "$ROOT$path" || fail "could not remove $path"
+            rm -rf -- "$ROOT$path" || fail "could not remove $path"
             # A service file that has gone must be forgotten by systemd too.
             case "$path" in /etc/systemd/system/*) UNITS_REMOVED=1 ;; esac
         done
