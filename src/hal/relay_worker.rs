@@ -4,14 +4,13 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
-use std::path::Path;
+
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::{Duration, Instant, MissedTickBehavior, interval};
 use tracing::{error, info, warn};
 
 use super::relay::RelayController;
 
-const OVERRIDE_PATH: &str = "/var/lib/highline-nexus/door-overrides.json";
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -167,7 +166,8 @@ fn valid_channel(channel: u8) -> bool {
 }
 
 fn load_overrides() -> PersistedOverrideFile {
-    let path = Path::new(OVERRIDE_PATH);
+    let path = crate::paths::overrides_path();
+    let path = path.as_path();
 
     if !path.exists() {
         return PersistedOverrideFile::default();
@@ -209,9 +209,11 @@ fn load_overrides() -> PersistedOverrideFile {
 }
 
 fn save_overrides(file: &PersistedOverrideFile) -> Result<()> {
-    let target = Path::new(OVERRIDE_PATH);
+    let target = crate::paths::overrides_path();
+    let target = target.as_path();
 
-    let temp = Path::new("/var/lib/highline-nexus/door-overrides.json.next");
+    let temp = target.with_extension("json.next");
+    let temp = temp.as_path();
 
     fs::create_dir_all(
         target
@@ -993,7 +995,7 @@ pub async fn run(mut receiver: mpsc::Receiver<RelayCommand>) {
                                 {
                                     error!(
                                         target:
-                                            "nexus_relay",
+                                            "indagate_relay",
                                         channel =
                                             channel,
                                         error =
@@ -1102,7 +1104,7 @@ pub async fn run(mut receiver: mpsc::Receiver<RelayCommand>) {
                                 {
                                     error!(
                                         target:
-                                            "nexus_relay",
+                                            "indagate_relay",
                                         channel =
                                             channel,
                                         error =

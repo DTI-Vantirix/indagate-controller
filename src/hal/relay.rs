@@ -304,7 +304,7 @@ impl RelayController {
             .request(
                 LineRequestFlags::OUTPUT,
                 if enabled { 1 } else { 0 },
-                "highline-nexus-relay",
+                "indagate-relay",
             )
             .context("request relay output")?;
 
