@@ -507,6 +507,7 @@ pub async fn run(profile: &BoardProfile, db_path: &str, relay_tx: mpsc::Sender<R
         match read_sysfs_gpio(input.legacy_gpio) {
             Ok(raw) => {
                 input.last_raw = Some(raw);
+                super::live_io::input_settled(&input.name, raw);
 
                 info!(
                     target: "indagate_input",
@@ -616,6 +617,7 @@ pub async fn run(profile: &BoardProfile, db_path: &str, relay_tx: mpsc::Sender<R
             let previous = input.last_raw;
 
             input.last_raw = Some(raw);
+            super::live_io::input_settled(&input.name, raw);
             input.candidate_raw = None;
             input.candidate_since = None;
 

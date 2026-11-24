@@ -321,11 +321,16 @@ impl RelayController {
     }
 
     pub fn set(&self, channel: u8, enabled: bool) -> Result<RelayState> {
-        if let Some(chip) = Self::discover_pca_gpiochip() {
-            return self.cdev_set(&chip, channel, enabled);
+        let result = match Self::discover_pca_gpiochip() {
+            Some(chip) => self.cdev_set(&chip, channel, enabled),
+            None => self.direct_set(channel, enabled),
+        };
+        // What the relays are doing, and whether the chip answered, goes in the check-in.
+        match &result {
+            Ok(state) => super::live_io::relay_switched(state.channel, state.enabled, state.backend),
+            Err(e) => super::live_io::relay_failed(&format!("{e:#}")),
         }
-
-        self.direct_set(channel, enabled)
+        result
     }
 
     pub fn pulse(&self, channel: u8, duration_ms: u64) -> Result<()> {

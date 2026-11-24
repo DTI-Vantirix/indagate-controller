@@ -395,7 +395,7 @@ pub async fn enroll(enrollment_token: &str, hardware_serial: &str) -> Result<Dev
         },
         "software": {
             "agent_version": env!("CARGO_PKG_VERSION"),
-            "firmware_version": "indagate-controller-dev"
+            "firmware_version": crate::hal::telemetry::firmware_version()
         }
     });
 
