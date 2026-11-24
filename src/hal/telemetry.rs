@@ -431,6 +431,12 @@ fn network_snapshot() -> Value {
     })
 }
 
+/// The firmware's version: the package version and the build it came from. A build made
+/// without naming itself (a developer's own) says so instead of passing for a release.
+pub fn firmware_version() -> String {
+    format!("{}+{}", env!("CARGO_PKG_VERSION"), option_env!("INDAGATE_BUILD").unwrap_or("dev"))
+}
+
 pub fn checkin_payload(event_count: i64, applied_version: u64) -> Value {
     let network = network_snapshot();
     let restarts = service_restart_count();
@@ -443,7 +449,7 @@ pub fn checkin_payload(event_count: i64, applied_version: u64) -> Value {
     json!({
         "software": {
             "agent_version": env!("CARGO_PKG_VERSION"),
-            "firmware_version": "indagate-controller-sp4-dev",
+            "firmware_version": firmware_version(),
             "os_version": os_version(),
             "kernel_version": kernel_version()
         },
@@ -456,6 +462,8 @@ pub fn checkin_payload(event_count: i64, applied_version: u64) -> Value {
             "applied_version": applied_version
         },
         "network": network,
+        // What every door, input and the fire input is doing right now.
+        "io": super::live_io::io_report(super::profile::acp4wr6_r1().doors.len() as u8),
         "health": {
             "cpu_health": cpu["status"],
             "cpu": cpu,
@@ -468,15 +476,24 @@ pub fn checkin_payload(event_count: i64, applied_version: u64) -> Value {
             "event_queue": {
                 "pending": event_count
             },
-            "relay": {
-                "backend": "DirectI2c",
-                "available": true
-            },
+            // As the relay driver last found it: how the chip is reached and whether the
+            // last switch worked. Nothing is claimed before a relay has been switched.
+            "relay": super::live_io::relay_report(),
             "system": {
                 "kernel_version": kernel_version()
             }
         }
     })
+}
+
+#[cfg(test)]
+mod version_tests {
+    #[test]
+    fn the_firmware_version_names_its_build() {
+        let version = super::firmware_version();
+        assert!(version.starts_with(concat!(env!("CARGO_PKG_VERSION"), "+")), "{version}");
+        assert!(version.len() > env!("CARGO_PKG_VERSION").len() + 1);
+    }
 }
 
 #[cfg(test)]
