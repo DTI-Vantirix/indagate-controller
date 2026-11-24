@@ -404,6 +404,82 @@ fn dns_servers() -> Vec<String> {
         .collect()
 }
 
+/// A value from ModemManager's output, which writes "--" where it has nothing.
+fn modem_text(value: &Value, path: &[&str]) -> Option<String> {
+    let mut at = value;
+    for key in path {
+        at = at.get(key)?;
+    }
+    let text = at.as_str()?.trim();
+    (!text.is_empty() && text != "--").then(|| text.to_string())
+}
+
+/// The cellular modem's details as the check-in carries them, from what ModemManager
+/// says about the modem (`mmcli -m ... -J`) and its SIM (`mmcli -i ... -J`). Only what
+/// the modem reports is included; a board with no SIM fitted says so by its state.
+fn cellular_report(modem: &Value, sim: Option<&Value>) -> Value {
+    let generic = &modem["modem"]["generic"];
+    let signal_percent = modem_text(generic, &["signal-quality", "value"]).and_then(|v| v.parse::<u8>().ok());
+    let technology = generic["access-technologies"]
+        .as_array()
+        .map(|list| list.iter().filter_map(Value::as_str).filter(|t| *t != "--").collect::<Vec<_>>().join(", "))
+        .filter(|joined| !joined.is_empty());
+    let state = modem_text(generic, &["state"]);
+    let failed = modem_text(generic, &["state-failed-reason"]);
+    json!({
+        "manufacturer": modem_text(generic, &["manufacturer"]),
+        "modem_model": modem_text(generic, &["model"]),
+        "modem_firmware": modem_text(generic, &["revision"]),
+        "imei": modem_text(&modem["modem"]["3gpp"], &["imei"]).or_else(|| modem_text(generic, &["equipment-identifier"])),
+        "iccid": sim.and_then(|sim| modem_text(sim, &["sim", "properties", "iccid"])),
+        "carrier": modem_text(&modem["modem"]["3gpp"], &["operator-name"])
+            .or_else(|| sim.and_then(|sim| modem_text(sim, &["sim", "properties", "operator-name"]))),
+        "connection_state": match (&state, &failed) {
+            (Some(state), Some(reason)) if state == "failed" => Some(format!("failed ({reason})")),
+            _ => state.clone(),
+        },
+        "registration": modem_text(&modem["modem"]["3gpp"], &["registration-state"]),
+        "technology": technology,
+        "signal_percent": signal_percent,
+        "signal_level": signal_percent.map(|percent| format!("{percent}%")),
+        "sim_present": sim.is_some(),
+    })
+}
+
+/// How long the modem's details are reused before ModemManager is asked again. A check-in
+/// goes out every few seconds; the modem's state does not change that fast.
+const CELLULAR_EVERY: Duration = Duration::from_secs(30);
+
+/// The cellular modem's details, or nothing when the board has no modem or no
+/// ModemManager. Asked for at most every `CELLULAR_EVERY`.
+fn cellular_snapshot() -> Value {
+    static LAST: std::sync::Mutex<Option<(std::time::Instant, Value)>> = std::sync::Mutex::new(None);
+    if let Ok(last) = LAST.lock() {
+        if let Some((at, value)) = last.as_ref() {
+            if at.elapsed() < CELLULAR_EVERY {
+                return value.clone();
+            }
+        }
+    }
+    let ask = |args: &[&str]| -> Option<Value> {
+        let mut all = vec!["--timeout=5"];
+        all.extend_from_slice(args);
+        serde_json::from_str(&command_output("mmcli", &all)?).ok()
+    };
+    let report = (|| {
+        let list = ask(&["-L", "-J"])?;
+        let modem_path = list["modem-list"].as_array()?.first()?.as_str()?.to_string();
+        let modem = ask(&["-m", &modem_path, "-J"])?;
+        let sim = modem_text(&modem["modem"]["generic"], &["sim"]).and_then(|path| ask(&["-i", &path, "-J"]));
+        Some(cellular_report(&modem, sim.as_ref()))
+    })()
+    .unwrap_or(Value::Null);
+    if let Ok(mut last) = LAST.lock() {
+        *last = Some((std::time::Instant::now(), report.clone()));
+    }
+    report
+}
+
 fn network_snapshot() -> Value {
     let primary = default_interface();
 
@@ -427,7 +503,8 @@ fn network_snapshot() -> Value {
     json!({
         "primary": primary,
         "dns": dns_servers(),
-        "interfaces": interfaces
+        "interfaces": interfaces,
+        "cellular": cellular_snapshot()
     })
 }
 
@@ -472,7 +549,7 @@ pub fn checkin_payload(event_count: i64, applied_version: u64) -> Value {
             "storage": storage,
             "temperature": temperature,
             "service_restart_count": restarts,
-            "network": network_snapshot()["primary"],
+            "network": network["primary"],
             "event_queue": {
                 "pending": event_count
             },
@@ -484,6 +561,57 @@ pub fn checkin_payload(event_count: i64, applied_version: u64) -> Value {
             }
         }
     })
+}
+
+#[cfg(test)]
+mod cellular_tests {
+    use super::cellular_report;
+    use serde_json::json;
+
+    #[test]
+    fn a_registered_modem_is_reported_in_full() {
+        let modem = json!({ "modem": {
+            "3gpp": { "imei": "860000000000001", "operator-name": "Example Mobile", "registration-state": "home" },
+            "generic": {
+                "manufacturer": "QUALCOMM INCORPORATED", "model": "QUECTEL Mobile Broadband Module",
+                "revision": "EC25AFAR05A04M4G", "state": "connected", "state-failed-reason": "--",
+                "access-technologies": ["lte"], "signal-quality": { "recent": "yes", "value": "72" },
+                "sim": "/org/freedesktop/ModemManager1/SIM/0"
+            }
+        }});
+        let sim = json!({ "sim": { "properties": { "iccid": "8900000000000000001", "operator-name": "Example" } } });
+        let report = cellular_report(&modem, Some(&sim));
+        assert_eq!(report["modem_model"], "QUECTEL Mobile Broadband Module");
+        assert_eq!(report["imei"], "860000000000001");
+        assert_eq!(report["iccid"], "8900000000000000001");
+        assert_eq!(report["carrier"], "Example Mobile");
+        assert_eq!(report["connection_state"], "connected");
+        assert_eq!(report["registration"], "home");
+        assert_eq!(report["technology"], "lte");
+        assert_eq!(report["signal_percent"], 72);
+        assert_eq!(report["signal_level"], "72%");
+        assert_eq!(report["sim_present"], true);
+    }
+
+    #[test]
+    fn a_modem_with_no_sim_says_so_and_claims_nothing_else() {
+        let modem = json!({ "modem": {
+            "3gpp": { "imei": "860000000000001", "operator-name": "--", "registration-state": "--" },
+            "generic": {
+                "manufacturer": "QUALCOMM INCORPORATED", "model": "QUECTEL Mobile Broadband Module",
+                "state": "failed", "state-failed-reason": "sim-missing",
+                "access-technologies": [], "signal-quality": { "recent": "no", "value": "0" }, "sim": "--"
+            }
+        }});
+        let report = cellular_report(&modem, None);
+        assert_eq!(report["connection_state"], "failed (sim-missing)");
+        assert_eq!(report["sim_present"], false);
+        assert!(report["iccid"].is_null());
+        assert!(report["carrier"].is_null());
+        assert!(report["registration"].is_null());
+        assert!(report["technology"].is_null());
+        assert_eq!(report["imei"], "860000000000001");
+    }
 }
 
 #[cfg(test)]
