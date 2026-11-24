@@ -55,6 +55,7 @@ fi
 
 CHANGES=0
 PROBLEMS=0
+UNITS_REMOVED=0
 say()  { echo "$*"; }
 plan() { CHANGES=$((CHANGES + 1)); if [ "$APPLY" = 1 ]; then echo "  doing: $*"; else echo "  would: $*"; fi; }
 fail() { PROBLEMS=$((PROBLEMS + 1)); echo "  PROBLEM: $*" >&2; }
@@ -170,6 +171,8 @@ if [ "$APPLY" = 1 ] && [ -n "$PRESENT" ]; then
         say "  archived to ${archive#"$ROOT"} ($(du -sh "$archive" | awk '{print $1}'))"
         for path in $PRESENT; do
             rm -rf -- "${ROOT:?}$path" 2>/dev/null || rm -rf -- "$ROOT$path" || fail "could not remove $path"
+            # A service file that has gone must be forgotten by systemd too.
+            case "$path" in /etc/systemd/system/*) UNITS_REMOVED=1 ;; esac
         done
     else
         rm -f "$archive"
@@ -226,7 +229,7 @@ for unit in indagate-board-power.service indagate-controller.service; do
     fi
 done
 if system; then
-    [ "$RELOAD" = 1 ] && systemctl daemon-reload
+    { [ "$RELOAD" = 1 ] || [ "$UNITS_REMOVED" = 1 ]; } && systemctl daemon-reload
     for unit in indagate-board-power.service indagate-controller.service; do
         if [ "$(systemctl is-enabled "$unit" 2>/dev/null)" != enabled ]; then
             plan "enable $unit to start at boot"
