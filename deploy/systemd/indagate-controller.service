@@ -5,8 +5,11 @@
 #     Environment=INDAGATE_SERVER_CA_FILE=/etc/indagate/<certificate>.crt
 [Unit]
 Description=Indagate door controller
-Wants=network-online.target indagate-board-power.service
-After=network-online.target indagate-board-power.service
+# It does not wait for the network: doors must work within seconds of power coming on,
+# and the controller works without the server, reaching it whenever the network is there.
+# (Waiting for network-online.target held it back two minutes after a power cut.)
+Wants=indagate-board-power.service
+After=indagate-board-power.service
 # monitor.service is the board maker's own application; the two must never run together.
 Conflicts=monitor.service
 StartLimitIntervalSec=60

@@ -34,6 +34,11 @@ The controller also prepares the line itself when it starts (`src/hal/board_setu
 along with every input line it reads. With the early service in place it finds the line
 already on. Without it the relays still work, but the wired network can drop.
 
+The controller's unit does not wait for the network. It makes its door decisions from its
+own database, so it starts as soon as the board's power line is on and reaches the server
+whenever the network comes up. Ordered after `network-online.target` it started two minutes
+after a power cut, with the doors dead until then.
+
 Nothing else on the board should prepare these lines. The board maker's application
 (`monitor.service`) used to; it must stay disabled, and the controller's unit conflicts
 with it so the two can never run together.
