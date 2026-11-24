@@ -43,6 +43,47 @@ Nothing else on the board should prepare these lines. The board maker's applicat
 (`monitor.service`) used to; it must stay disabled, and the controller's unit conflicts
 with it so the two can never run together.
 
+## Preparing a new board
+
+A board arrives from its maker with things an Indagate controller must not have. Run
+`prepare-board.sh` once on every board, before it goes into service.
+
+| What the board comes with | Why it has to go |
+|---|---|
+| The maker's application, started by `monitor.service` | It drives the same relays, readers and inputs |
+| The maker's update client (Mender: `mender-authd`, `mender-updated`, `mender-connect`) | It takes software, and remote terminal sessions, from the maker's account |
+| A software-update web page (`swupdate`, port 8080) | Anyone on the network can offer the board a new system image |
+| An FTP server (`vsftpd`) | A second way to log in, with the password sent unprotected |
+| Accounts `user` and `weston` with published passwords | Anyone can look the passwords up |
+
+The script switches the services off and masks them, removes the packages and files,
+locks the two accounts, and installs the two Indagate services. Everything it removes is
+first copied into one archive under `/root`.
+
+```bash
+scp -r deploy root@<board>:/root/indagate-deploy       # from the firmware repository
+ssh root@<board>
+bash /root/indagate-deploy/prepare-board.sh            # shows what it would do; changes nothing
+bash /root/indagate-deploy/prepare-board.sh --apply    # does it
+```
+
+Then, by hand:
+
+1. Change the root password (`passwd`). The script does not touch it.
+2. Install a release and set the server address (next section).
+3. Do the checks at the end of this page, including the reboot and the power cut.
+4. Delete the archive under `/root` once the checks pass. It can hold the maker's update
+   token.
+
+`--no-display` also switches off the display service, for a board with no screen.
+`--remove-pre-rename` is for a board that ran Indagate under its old names
+(`hlaxs-access`, `highline-nexus`): it removes that layout too, and refuses unless the
+board is already running from `/var/lib/indagate`.
+
+The script leaves the operating system, the boot loader, the board support services
+(`variscite-*`, NetworkManager, the modem, Bluetooth, Wi-Fi) and SSH alone. It ends by
+listing what still accepts connections from the network, for you to judge.
+
 ## Installing or updating
 
 ```bash
