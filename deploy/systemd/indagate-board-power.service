@@ -1,0 +1,20 @@
+# Switches the board's I/O power on (line GPIO1_IO06) before the network comes up.
+#
+# The line powers the bus the relay chip sits on, and a cellular modem. If it is switched
+# on after the wired network is already up, the Ethernet PHY stops passing traffic until
+# the interface is re-initialised. So it is done here, before the network starts.
+# The controller also drives the line itself at start; it then finds it already on.
+[Unit]
+Description=Indagate board I/O power on (line 6), before the network comes up
+DefaultDependencies=no
+After=sysinit.target
+Before=network-pre.target NetworkManager.service
+Wants=network-pre.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c '[ -e /sys/class/gpio/gpio6 ] || echo 6 > /sys/class/gpio/export; echo high > /sys/class/gpio/gpio6/direction; sleep 1'
+
+[Install]
+WantedBy=multi-user.target
