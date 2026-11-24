@@ -548,6 +548,27 @@ const POLL_EVERY: std::time::Duration = std::time::Duration::from_millis(20);
 const SETTINGS_CHECK_EVERY: std::time::Duration = std::time::Duration::from_secs(3);
 /// How long an alarm's buzzer is left alone after a card, so the card's beeps are heard.
 const SOUNDER_RESUMES_AFTER: std::time::Duration = std::time::Duration::from_secs(2);
+/// How long after a resting light is first sent it is sent once more. A reader that has
+/// only just connected can lose the first one: seen on the bench, where a reader stayed
+/// dark after every restart until a card made the controller send its light again.
+const LIGHT_CONFIRM_AFTER: std::time::Duration = std::time::Duration::from_secs(3);
+/// How often a resting light that has not changed is sent again, so a reader that lost it
+/// without dropping its link (a brief power dip, say) is put right before long.
+const LIGHT_REFRESH_EVERY: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Whether the reader should be sent its resting light now. A light that differs from the
+/// one showing goes at once. One that is the same is sent again once shortly after it was
+/// first sent, and from then on at a slow, steady pace.
+fn light_due(unchanged: bool, sends: u32, since_last: Option<std::time::Duration>) -> bool {
+    if !unchanged {
+        return true;
+    }
+    match since_last {
+        None => true,
+        Some(age) => age >= if sends <= 1 { LIGHT_CONFIRM_AFTER } else { LIGHT_REFRESH_EVERY },
+    }
+}
+
 /// How long to wait before sending a light command again after one could not go out.
 const LIGHT_RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(1);
 /// How long to wait before trying again after the bus could not be started.
@@ -635,6 +656,8 @@ pub async fn run(serial_port: &str, db_path: &str, relay_tx: tokio::sync::mpsc::
         let mut lights = db.osdp_reader_lights().unwrap_or_default();
         let mut shown: Vec<Option<(LightColor, Blink)>> = readers.iter().map(|_| None).collect();
         let mut light_failed: Vec<Option<std::time::Instant>> = readers.iter().map(|_| None).collect();
+        // How many times the light now showing has been sent, and when it last was.
+        let mut light_sent: Vec<(u32, Option<std::time::Instant>)> = readers.iter().map(|_| (0, None)).collect();
         // Whether each reader's buzzer was last told to sound for a door alarm, and until
         // when it is left alone so the beeps for a card are heard.
         let mut sounding: Vec<bool> = readers.iter().map(|_| false).collect();
@@ -691,14 +714,19 @@ pub async fn run(serial_port: &str, db_path: &str, relay_tx: tokio::sync::mpsc::
                             }
                         };
                     }
+                    // Sent when it changes, said once more a few seconds later, and
+                    // refreshed now and then (see `light_due`).
+                    let unchanged = shown[index] == Some(wanted);
+                    let (sends, last_sent) = light_sent[index];
                     if link.online
                         && !reader.enrolling
-                        && shown[index] != Some(wanted)
+                        && light_due(unchanged, sends, last_sent.map(|at: std::time::Instant| at.elapsed()))
                         && light_failed[index].is_none_or(|at| at.elapsed() >= LIGHT_RETRY_AFTER)
                     {
                         match bus.resting_light(link.channel, wanted.0, wanted.1) {
                             Ok(()) => {
                                 shown[index] = Some(wanted);
+                                light_sent[index] = (if unchanged { sends.saturating_add(1) } else { 1 }, Some(std::time::Instant::now()));
                                 light_failed[index] = None;
                             }
                             Err(err) => {
@@ -1613,6 +1641,22 @@ mod tests {
         // Without settings a reader gets what it always got.
         let (led, buzzer) = feedback_commands(Feedback::Granted);
         assert_eq!(feedback_with(Feedback::Granted, None), (Some(led), Some(buzzer)));
+    }
+
+    #[test]
+    fn a_resting_light_is_confirmed_once_and_then_kept_fresh() {
+        let secs = |n| Some(Duration::from_secs(n));
+        // A different light goes at once, however recently one was sent.
+        assert!(light_due(false, 5, secs(0)));
+        assert!(light_due(false, 0, None));
+        // The same light, sent once: again after a few seconds, not before.
+        assert!(!light_due(true, 1, secs(1)));
+        assert!(light_due(true, 1, Some(LIGHT_CONFIRM_AFTER)));
+        // Sent twice or more: only at the slow refresh.
+        assert!(!light_due(true, 2, Some(LIGHT_CONFIRM_AFTER)));
+        assert!(!light_due(true, 2, secs(30)));
+        assert!(light_due(true, 2, Some(LIGHT_REFRESH_EVERY)));
+        assert!(light_due(true, 9, Some(LIGHT_REFRESH_EVERY)));
     }
 
     #[test]
